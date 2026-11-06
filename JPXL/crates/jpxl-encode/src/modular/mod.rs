@@ -1286,12 +1286,13 @@ pub(crate) fn build_global_residual_model_with_resources(
     source.validate()?;
     let section_events = collect_all_section_residuals(source, geometry, resources)?;
     let num_contexts = source.tree.num_contexts().max(1);
-    let plain = tables_from_plain_events(num_contexts, &section_events)?;
+    let workers = resources.workers_for(section_events.len());
+    let plain = tables_from_plain_events(num_contexts, &section_events, workers)?;
     let tables = if source.allow_lz77 {
-        match tables_from_lz77_events(num_contexts, &section_events) {
+        match tables_from_lz77_events(num_contexts, &section_events, workers) {
             Ok(lz)
-                if residual_model_bits(&lz, &section_events, true)
-                    < residual_model_bits(&plain, &section_events, false) =>
+                if residual_model_bits(&lz, &section_events, true, workers)
+                    < residual_model_bits(&plain, &section_events, false, workers) =>
             {
                 lz
             }
@@ -1301,6 +1302,28 @@ pub(crate) fn build_global_residual_model_with_resources(
         plain
     };
     Ok(GlobalResidualModel { tables })
+}
+
+/// Splits `sections` into at most `workers` contiguous chunks, maps each
+/// chunk with `f` on the worker pool, and returns the results in chunk
+/// order.
+///
+/// The model-building passes below are per-section and independent; what
+/// they reduce to — census counts and bit lengths — are integer sums. Each
+/// chunk visits its sections in order and the chunks are reduced in order,
+/// so the first error in section order is still the one reported, and the
+/// sums (hence the tables and the bytes) cannot depend on the worker count
+/// (Contract A).
+fn map_section_chunks<T, F>(sections: &[SectionResiduals], workers: usize, f: F) -> Result<Vec<T>>
+where
+    T: Send,
+    F: Fn(&[SectionResiduals]) -> Result<T> + Sync,
+{
+    let chunk = sections.len().div_ceil(workers.max(1)).max(1);
+    let chunks: Vec<&[SectionResiduals]> = sections.chunks(chunk).collect();
+    crate::resources::ordered_map(chunks.len(), workers, |index| {
+        f(chunks.get(index).copied().unwrap_or(&[]))
+    })
 }
 
 /// One residual stream's `(context, value)` sequence plus its distance multiplier.
@@ -1392,11 +1415,12 @@ fn collect_all_section_residuals(
     Ok(out)
 }
 
-fn tables_from_plain_events(
+/// One chunk's literal census: every `(ctx, value)` event recorded in
+/// section order, plus whether there was any event at all.
+fn literal_census(
     num_contexts: usize,
     sections: &[SectionResiduals],
-) -> Result<EntropyTables> {
-    let num_contexts = num_contexts.max(1);
+) -> Result<(TokenCensus, bool)> {
     let mut census = TokenCensus::new(num_contexts)?;
     let mut any = false;
     for sec in sections {
@@ -1405,6 +1429,33 @@ fn tables_from_plain_events(
             any = true;
         }
     }
+    Ok((census, any))
+}
+
+/// The literal census of every section, built per chunk and merged in order.
+fn merged_literal_census(
+    num_contexts: usize,
+    sections: &[SectionResiduals],
+    workers: usize,
+) -> Result<(TokenCensus, bool)> {
+    let mut census = TokenCensus::new(num_contexts)?;
+    let mut any = false;
+    for (part, part_any) in map_section_chunks(sections, workers, |chunk| {
+        literal_census(num_contexts, chunk)
+    })? {
+        census.merge_from(part)?;
+        any |= part_any;
+    }
+    Ok((census, any))
+}
+
+fn tables_from_plain_events(
+    num_contexts: usize,
+    sections: &[SectionResiduals],
+    workers: usize,
+) -> Result<EntropyTables> {
+    let num_contexts = num_contexts.max(1);
+    let (mut census, any) = merged_literal_census(num_contexts, sections, workers)?;
     seed_empty_contexts(&mut census, num_contexts, !any);
     let config = best_hybrid_config(&census, num_contexts, None)?;
     let plan = EncoderPlan::identity(num_contexts, CodingMode::Ans, config)?;
@@ -1415,17 +1466,11 @@ fn tables_from_plain_events(
 fn tables_from_lz77_events(
     num_contexts: usize,
     sections: &[SectionResiduals],
+    workers: usize,
 ) -> Result<EntropyTables> {
     let num_contexts = num_contexts.max(1);
     // Literal-only census first → min_symbol.
-    let mut lit_census = TokenCensus::new(num_contexts)?;
-    let mut any_lit = false;
-    for sec in sections {
-        for &(ctx, value) in &sec.events {
-            lit_census.record(ctx, value)?;
-            any_lit = true;
-        }
-    }
+    let (mut lit_census, any_lit) = merged_literal_census(num_contexts, sections, workers)?;
     if !any_lit {
         return Err(EncodeError::unsupported(
             "LZ77 with no residual samples across sections",
@@ -1446,31 +1491,43 @@ fn tables_from_lz77_events(
 
     let dist_ctx = num_contexts;
     let num_dist = num_contexts + 1;
-    let mut census = TokenCensus::new(num_dist)?;
-    let mut any_copy = false;
-    for sec in sections {
-        if sec.events.is_empty() {
-            continue;
-        }
-        let coded = greedy_lz77_events(
-            &sec.events,
-            RESIDUAL_LZ77_MIN_LENGTH,
-            max_length,
-            sec.dist_multiplier,
-        );
-        for ev in &coded {
-            match *ev {
-                LzEvent::Lit { ctx, value } => census.record(ctx, value)?,
-                LzEvent::Copy {
-                    ctx,
-                    length,
-                    raw_distance,
-                } => {
-                    any_copy = true;
-                    census.record_copy(ctx, length, raw_distance, dist_ctx, &lz77)?;
+    // The greedy LZ77 parse is per section (matches never cross a section),
+    // so each chunk parses and counts its own sections; the merged counts
+    // are the serial loop's.
+    let parts = map_section_chunks(sections, workers, |chunk| {
+        let mut census = TokenCensus::new(num_dist)?;
+        let mut any_copy = false;
+        for sec in chunk {
+            if sec.events.is_empty() {
+                continue;
+            }
+            let coded = greedy_lz77_events(
+                &sec.events,
+                RESIDUAL_LZ77_MIN_LENGTH,
+                max_length,
+                sec.dist_multiplier,
+            );
+            for ev in &coded {
+                match *ev {
+                    LzEvent::Lit { ctx, value } => census.record(ctx, value)?,
+                    LzEvent::Copy {
+                        ctx,
+                        length,
+                        raw_distance,
+                    } => {
+                        any_copy = true;
+                        census.record_copy(ctx, length, raw_distance, dist_ctx, &lz77)?;
+                    }
                 }
             }
         }
+        Ok((census, any_copy))
+    })?;
+    let mut census = TokenCensus::new(num_dist)?;
+    let mut any_copy = false;
+    for (part, part_any) in parts {
+        census.merge_from(part)?;
+        any_copy |= part_any;
     }
     if !any_copy {
         return Err(EncodeError::unsupported(
@@ -1489,17 +1546,24 @@ fn residual_model_bits(
     tables: &EntropyTables,
     sections: &[SectionResiduals],
     use_lz77: bool,
+    workers: usize,
 ) -> u64 {
-    let mut total = tables_bundle_bit_len(tables);
-    for sec in sections {
-        total = total.saturating_add(stream_bit_len(
-            tables,
-            &sec.events,
-            sec.dist_multiplier,
-            use_lz77,
-        ));
-    }
-    total
+    // Saturating sums of non-negative terms are min(true sum, MAX) in any
+    // order, so the chunked total is the serial total.
+    let parts = map_section_chunks(sections, workers, |chunk| {
+        Ok(chunk.iter().fold(0u64, |acc, sec| {
+            acc.saturating_add(stream_bit_len(
+                tables,
+                &sec.events,
+                sec.dist_multiplier,
+                use_lz77,
+            ))
+        }))
+    });
+    let streams = parts.map_or(u64::MAX / 4, |parts| {
+        parts.into_iter().fold(0u64, u64::saturating_add)
+    });
+    tables_bundle_bit_len(tables).saturating_add(streams)
 }
 
 fn tables_bundle_bit_len(tables: &EntropyTables) -> u64 {
