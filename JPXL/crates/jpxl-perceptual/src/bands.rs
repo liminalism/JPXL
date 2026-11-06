@@ -18,6 +18,25 @@ pub(crate) const fn band_count(rows: usize) -> usize {
     rows.div_ceil(BAND_ROWS)
 }
 
+/// Shapes `buf` to `len` zeros, exactly as `clear()` then `resize(len, 0.0)`.
+///
+/// The difference is who pays for fresh memory. When `buf` must grow,
+/// `resize` zero-fills the new allocation on the calling thread — for a
+/// frame-sized scratch plane that is tens of megabytes of serial page
+/// faulting on the main thread, which profiling put at ~8% of a 6 MP
+/// encode's wall time. `vec!`'s zeroed allocation hands out the kernel's
+/// lazily zeroed pages instead, so they are first touched by the band
+/// workers that write them, in parallel. Either way the buffer holds `len`
+/// zeros on return, so callers see identical contents.
+pub(crate) fn zeroed_in_place(buf: &mut Vec<f32>, len: usize) {
+    if buf.capacity() < len {
+        *buf = vec![0.0; len];
+    } else {
+        buf.clear();
+        buf.resize(len, 0.0);
+    }
+}
+
 /// Byte-free view of one band of a read-only plane.
 pub(crate) fn band_of(plane: &[f32], band: usize, band_len: usize) -> &[f32] {
     let start = band.saturating_mul(band_len).min(plane.len());

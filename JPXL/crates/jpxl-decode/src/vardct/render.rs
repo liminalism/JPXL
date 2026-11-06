@@ -30,9 +30,13 @@
 //! Section walking, bit positions and the TOC belong to
 //! [`crate::decode`]; the parameter bundles belong to the sibling modules.
 
+use std::sync::OnceLock;
+
 use jpxl_core::color::OpsinInverse;
 use jpxl_core::limits::AllocGuard;
-use jpxl_core::varblock::{CoeffMatrix, SampleBlock, TransformType, llf_from_lf};
+use jpxl_core::varblock::{
+    CoeffMatrix, NUM_DEQUANT_MATRICES, SampleBlock, TransformType, llf_from_lf,
+};
 
 use crate::decode::{ReferenceFrame, unsupported};
 use crate::error::{DecodeError, Result};
@@ -41,7 +45,7 @@ use crate::frame::patches::{PatchBlendMode, PatchDictionary, blend as patch_blen
 use crate::frame::restoration::RestorationFilter;
 use crate::frame::{SigmaField, epf, gaborish_into, vardct_sigma};
 use crate::vardct::cfl;
-use crate::vardct::dequant_matrix::DequantMatrices;
+use crate::vardct::dequant_matrix::{DequantMatrices, DequantMatrix};
 use crate::vardct::hf_coeff::QuantCoeffBlock;
 use crate::vardct::lf::DequantPlane;
 
@@ -227,11 +231,78 @@ impl ExtraPlanes {
 // I.5.3 — HF dequantization
 // ---------------------------------------------------------------------------
 
+/// The I.2.4 dequantization matrices of one frame, each built at most once.
+///
+/// [`DequantMatrices::for_transform`] evaluates the I.2.4 weights rules from
+/// the parameter set on every call — for the DCT mode that is one `pow` per
+/// matrix cell, plus two allocations — and I.5.3 needs a matrix for every
+/// varblock and channel. Profiling a 6 MP decode put that rebuild at about a
+/// fifth of the VarDCT CPU time. The matrices are a pure function of the
+/// frame's `HfGlobal`, so this cache evaluates each `(index, channel)` slot
+/// the first time a varblock asks for it and hands every later caller the
+/// same matrix: the values are exactly those the uncached call would
+/// produce, so the decoded samples are bit-identical.
+///
+/// Slots are [`OnceLock`]s so the render workers can share one cache by
+/// reference. Two workers racing on an empty slot may both build it; the
+/// builds are identical and one is kept. A failed build is not cached — the
+/// error aborts the decode at the first varblock that hits it, as before.
+///
+/// Memory is bounded by the standard, not by the stream: 17 indices x 3
+/// channels of at most the Table I.1 sizes, about 1.6 MB in the worst case
+/// (see [`DequantMatrices::build_all`]), and typically a few KiB because
+/// only the transform types the frame uses are ever built.
+#[derive(Debug)]
+pub struct DequantMatrixCache<'a> {
+    matrices: &'a DequantMatrices,
+    slots: [[OnceLock<DequantMatrix>; NUM_CHANNELS]; NUM_DEQUANT_MATRICES],
+}
+
+impl<'a> DequantMatrixCache<'a> {
+    /// An empty cache over one frame's matrices.
+    #[must_use]
+    pub fn new(matrices: &'a DequantMatrices) -> Self {
+        Self {
+            matrices,
+            slots: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
+        }
+    }
+
+    /// The dequantization matrix `transform` uses in `channel` (Table I.4),
+    /// built on first use.
+    ///
+    /// # Errors
+    ///
+    /// As [`DequantMatrices::for_transform`].
+    pub fn for_transform(
+        &self,
+        transform: TransformType,
+        channel: usize,
+    ) -> Result<&DequantMatrix> {
+        let index = transform.dequant_matrix_index();
+        let Some(slot) = self.slots.get(index).and_then(|row| row.get(channel)) else {
+            // Unreachable for a valid transform (index < 17) and channel
+            // (< 3); let the matrices report it with their own citation.
+            self.matrices.for_transform(transform, channel)?;
+            return Err(DecodeError::out_of_range(
+                "channel",
+                "I.2.4",
+                channel as u64,
+            ));
+        };
+        if let Some(matrix) = slot.get() {
+            return Ok(matrix);
+        }
+        let built = self.matrices.for_transform(transform, channel)?;
+        Ok(slot.get_or_init(|| built))
+    }
+}
+
 /// Everything I.5.3 needs that does not vary per varblock.
 #[derive(Debug, Clone, Copy)]
 pub struct HfDequantParams<'a> {
-    /// I.2.4 dequantization matrices, from `HfGlobal`.
-    pub matrices: &'a DequantMatrices,
+    /// I.2.4 dequantization matrices, from `HfGlobal`, cached per frame.
+    pub matrices: &'a DequantMatrixCache<'a>,
     /// `oim.quant_bias[0..3]` (Table L.1), indexed by the I.1 channel
     /// numbering `0 = X, 1 = Y, 2 = B`.
     pub quant_bias: [f32; NUM_CHANNELS],
@@ -960,7 +1031,7 @@ mod tests {
     use super::*;
     use jpxl_core::limits::Limits;
 
-    fn params(matrices: &DequantMatrices) -> HfDequantParams<'_> {
+    fn params<'a>(matrices: &'a DequantMatrixCache<'a>) -> HfDequantParams<'a> {
         HfDequantParams {
             matrices,
             quant_bias: [0.5, 0.25, 0.125],
@@ -977,7 +1048,8 @@ mod tests {
         // the exponent offset by 2 (so the default b_qm_scale == 2 is a no-op
         // and the default x_qm_scale == 3 multiplies by exactly 0.8).
         let m = DequantMatrices::all_default().unwrap();
-        let p = params(&m);
+        let c = DequantMatrixCache::new(&m);
+        let p = params(&c);
         assert_eq!(p.qm_multiplier(1), 1.0);
         assert!((p.qm_multiplier(0) - 0.8).abs() < 1e-7);
         assert_eq!(p.qm_multiplier(2), 1.0);
@@ -995,7 +1067,8 @@ mod tests {
     fn hf_multiplier_matches_the_hand_computed_formula() {
         // Mul = 65536 / (global_scale * HfMul), hand-computed.
         let m = DequantMatrices::all_default().unwrap();
-        let p = params(&m);
+        let c = DequantMatrixCache::new(&m);
+        let p = params(&c);
         assert!((p.hf_multiplier(1) - 65536.0 / 4096.0).abs() < 1e-6);
         assert!((p.hf_multiplier(16) - 1.0).abs() < 1e-6);
     }
@@ -1006,7 +1079,8 @@ mod tests {
         // |q| > 1 subtracts the reciprocal term. Both are checked at the
         // boundary itself, which is where a `<` / `<=` slip would show.
         let m = DequantMatrices::all_default().unwrap();
-        let p = params(&m);
+        let c = DequantMatrixCache::new(&m);
+        let p = params(&c);
 
         assert_eq!(p.bias_adjust(0, 0), 0.0);
         assert!((p.bias_adjust(1, 0) - 0.5).abs() < 1e-7);
@@ -1021,7 +1095,8 @@ mod tests {
         // Proves the LLF cells 8C never writes contribute nothing before I.8
         // overwrites them, whatever the bias bundle says.
         let m = DequantMatrices::all_default().unwrap();
-        let p = params(&m);
+        let c = DequantMatrixCache::new(&m);
+        let p = params(&c);
         for t in [
             TransformType::Dct8x8,
             TransformType::Dct16x8,
@@ -1043,7 +1118,8 @@ mod tests {
         // The orientation trap: a DCT16x8's coefficients are 8 rows x 16
         // columns even though its samples are 16 rows x 8 columns.
         let m = DequantMatrices::all_default().unwrap();
-        let p = params(&m);
+        let c = DequantMatrixCache::new(&m);
+        let p = params(&c);
         let t = TransformType::Dct16x8;
         let out = dequantize_hf_block(t, 1, &QuantCoeffBlock::zeros(t), 1, &p).unwrap();
         assert_eq!((out.rows(), out.cols()), (8, 16));
@@ -1076,7 +1152,8 @@ mod tests {
         // It proves the I.8 -> I.9 handoff (the LLF DC scaling, the DC-only
         // IDCT normalization, and the landscape/portrait flip) all at once.
         let m = DequantMatrices::all_default().unwrap();
-        let p = params(&m);
+        let c = DequantMatrixCache::new(&m);
+        let p = params(&c);
 
         for t in TransformType::ALL {
             let (rows, cols) = t.block_dims();

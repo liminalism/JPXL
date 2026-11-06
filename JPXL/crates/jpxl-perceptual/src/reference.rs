@@ -306,8 +306,7 @@ pub(crate) fn downscale_planes(
 ) {
     let out_len = pyramid::half(in_w) * pyramid::half(in_h);
     for plane in dst.iter_mut() {
-        plane.clear();
-        plane.resize(out_len, 0.0);
+        crate::bands::zeroed_in_place(plane, out_len);
     }
     let [d0, d1, d2] = dst;
     let items = crate::bands::Handoff::new(vec![

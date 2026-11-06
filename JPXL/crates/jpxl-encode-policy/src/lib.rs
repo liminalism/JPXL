@@ -133,7 +133,10 @@ pub use field::{AqMode, AqTuning};
 
 use field::{DesiredQuantField, mul_lattice_for};
 pub use policy_bank::{PerceptualPolicy, rank_alternatives};
-pub use preanalysis::{PreanalysisFeatures, preanalysis_srgb8, preanalysis_srgb16};
+pub use preanalysis::{
+    PreanalysisFeatures, preanalysis_srgb8, preanalysis_srgb8_with, preanalysis_srgb16,
+    preanalysis_srgb16_with,
+};
 pub use quality::{
     LadderPoint, PerceptualEvaluator, PerceptualObservation, PolicyTrial, ProbeKind, QualityBudget,
     QualityOutcome, QualityPredictionTrace, QualityProbe, QualityStats, QualityStatus, QualityWork,

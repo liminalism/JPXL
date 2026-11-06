@@ -373,6 +373,12 @@ fn dynamic8(
     let output_channels = if flatten_gray_to_rgb { 3 } else { channels };
     let stride = output_channels + usize::from(keep_alpha);
     let pixels = pixel_count(image)?;
+    if alpha.is_none()
+        && let Some(raw) =
+            interleave_native(image, pixels, 255, |v| u8::try_from(v).unwrap_or(u8::MAX))
+    {
+        return dynamic_from_u8(image.width, image.height, output_channels, false, raw);
+    }
     let alpha_plane = alpha.and_then(|info| image.planes.get(info.plane));
     let mut raw = Vec::with_capacity(pixels.saturating_mul(stride));
     for index in 0..pixels {
@@ -430,6 +436,13 @@ fn dynamic16(
     let output_channels = if flatten_gray_to_rgb { 3 } else { channels };
     let stride = output_channels + usize::from(keep_alpha);
     let pixels = pixel_count(image)?;
+    if alpha.is_none()
+        && let Some(raw) = interleave_native(image, pixels, 65_535, |v| {
+            u16::try_from(v).unwrap_or(u16::MAX)
+        })
+    {
+        return dynamic_from_u16(image.width, image.height, output_channels, false, raw);
+    }
     let alpha_plane = alpha.and_then(|info| image.planes.get(info.plane));
     let mut raw = Vec::with_capacity(pixels.saturating_mul(stride));
     for index in 0..pixels {
@@ -479,6 +492,54 @@ fn dynamic16(
 fn pixel_count(image: &jpxl_decode::DecodedImage) -> Result<usize, String> {
     usize::try_from(u64::from(image.width) * u64::from(image.height))
         .map_err(|_| "decoded image is too large for this host".to_owned())
+}
+
+/// The opaque fast path of [`dynamic8`] / [`dynamic16`]: interleaves the
+/// colour planes when every one of them is already at the output depth.
+///
+/// At equal depth [`scaled_sample`]'s rescale is the identity —
+/// `(s * m + m / 2) / m == s` for `0 <= s <= m`, because `m / 2 < m` — so
+/// this is the general loop's exact result with the per-sample 64-bit
+/// division removed. Returns `None` (and the caller takes the general loop)
+/// for any other depth, a short plane, or a channel count other than 1 or 3.
+fn interleave_native<T>(
+    image: &jpxl_decode::DecodedImage,
+    pixels: usize,
+    target_max: u32,
+    narrow: impl Fn(u32) -> T,
+) -> Option<Vec<T>> {
+    let channels = image.num_colour_channels;
+    let planes = image.planes.get(..channels)?;
+    if !matches!(channels, 1 | 3)
+        || planes
+            .iter()
+            .any(|plane| plane.max_value() != target_max || plane.samples.len() < pixels)
+    {
+        return None;
+    }
+    let clamp = |v: i32| -> T {
+        let v = u32::try_from(v.max(0)).unwrap_or(0).min(target_max);
+        narrow(v)
+    };
+    let mut raw = Vec::with_capacity(pixels.saturating_mul(channels));
+    match planes {
+        [gray] => raw.extend(gray.samples.iter().take(pixels).map(|&v| clamp(v))),
+        [r, g, b] => {
+            for ((&r, &g), &b) in r
+                .samples
+                .iter()
+                .zip(&g.samples)
+                .zip(&b.samples)
+                .take(pixels)
+            {
+                raw.push(clamp(r));
+                raw.push(clamp(g));
+                raw.push(clamp(b));
+            }
+        }
+        _ => return None,
+    }
+    Some(raw)
 }
 
 fn scaled_sample(plane: &jpxl_decode::Plane, index: usize, target_max: u32) -> u32 {

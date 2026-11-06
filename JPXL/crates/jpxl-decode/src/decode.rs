@@ -57,7 +57,7 @@ use crate::frame::{
 };
 use crate::headers::{ImageHeaders, ImageMetadata, Orientation, decode_image_headers_metered};
 use crate::modular::{
-    Channel, ChannelSpec, ChannelStop, GlobalTree, ModularOptions, TreeSource,
+    Channel, ChannelSpec, ChannelStop, GlobalTree, ModularImage, ModularOptions, TreeSource,
     decode_sub_bitstream_partial, decode_sub_bitstream_with, read_global_tree,
 };
 
@@ -2056,24 +2056,46 @@ fn decode_modular_frame(
             &decoded_in_pass,
         );
 
+        let mut sections = Vec::with_capacity(usize::try_from(num_groups).unwrap_or(0));
         for group in 0..num_groups {
             let rect = geometry
                 .group_rect(group)
                 .ok_or_else(|| unsupported("a group index past the grid", "18181-1 G.4"))?;
             // H.4.1: ModularGroup streams are numbered
             // 1 + 3 * num_lf_groups + 17 + num_groups * pass + group.
-            options.stream_index =
-                stream_index_of::modular_group(geometry, u64::from(pass), group)?;
+            let stream_index = stream_index_of::modular_group(geometry, u64::from(pass), group)?;
             let section = 2 + num_lf_groups + num_groups * u64::from(pass) + group;
-            decode_group_section(
+            sections.push(GroupSection {
+                rect,
+                section: usize::try_from(section).unwrap_or(0),
+                stream_index,
+            });
+        }
+        if single || selected.is_empty() {
+            for job in &sections {
+                options.stream_index = job.stream_index;
+                decode_group_section(
+                    codestream,
+                    base,
+                    toc,
+                    single.then_some(&mut single_reader),
+                    job.section,
+                    &mut partial,
+                    &selected,
+                    job.rect,
+                    global_tree.as_ref(),
+                    &options,
+                    guard,
+                )?;
+            }
+        } else {
+            decode_group_sections_threaded(
                 codestream,
                 base,
                 toc,
-                single.then_some(&mut single_reader),
-                usize::try_from(section).unwrap_or(0),
+                &sections,
                 &mut partial,
                 &selected,
-                rect,
                 global_tree.as_ref(),
                 &options,
                 guard,
@@ -2147,28 +2169,151 @@ fn decode_group_section(
     }
 }
 
-/// One LF-group or pass-group modular sub-bitstream, read from `reader` at its
-/// current position and copied back into the frame-wide channel list.
+/// One pass group's TOC section, in the order the serial loop visits it.
+struct GroupSection {
+    rect: Rect,
+    section: usize,
+    stream_index: u32,
+}
+
+/// The G.4.2 pass-group loop of a multi-section modular frame, with the
+/// sub-bitstreams decoded on a `std::thread::scope` pool.
 ///
-/// Split from [`decode_group_section`] because a `kVarDCT` frame reaches the
-/// same two sub-bitstreams (G.2.3, G.4.2) from the middle of a section it is
-/// already reading — `ModularLfGroup` sits between `LfQuant` and `HfMetadata`,
-/// and `Modular group data` follows the HF coefficients — so it has a reader
-/// but no section index. G.2.3 and G.4.2 are one code path for both encodings;
-/// only the channel selection differs, and that is the caller's.
-fn decode_group_channels(
-    reader: &mut BitReader<'_>,
+/// **Same samples and same outcome as the serial loop, by construction.**
+/// Each group is its own TOC section with its own reader, its own stream
+/// index, read-only access to the global tree, and its own freshly decoded
+/// channels: no group reads anything another group writes. The pool decodes
+/// a wave of up to one group per worker; the main thread then copies each
+/// group's channels into the frame in group order, exactly as the serial
+/// loop does. The channel layout a group decodes into depends only on the
+/// frame's channel shapes, which group decoding never changes, so it is
+/// computed up front.
+///
+/// The allocation guard is cumulative, so the workers cannot share it. Each
+/// gets a private budget of `remaining / wave` (keeping the wave's combined
+/// peak within what the guard has left), and its charge is replayed into the
+/// real guard in group order. The decoder never releases a charge, so a
+/// group's final charge is its peak, and a group whose charge fits the real
+/// guard here would have fitted in the serial decode too. Anything else — a
+/// worker error of any kind, including running out of its share, or a charge
+/// that does not fit — re-decodes that group serially against the real
+/// guard, which reproduces the serial decode's result or error exactly.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the serial loop's inputs, passed through unchanged"
+)]
+fn decode_group_sections_threaded(
+    codestream: &[u8],
+    base: usize,
+    toc: &Toc,
+    sections: &[GroupSection],
     partial: &mut crate::modular::PartialModular,
     selected: &[usize],
-    rect: Rect,
     global_tree: Option<&GlobalTree>,
     options: &ModularOptions,
     guard: &mut AllocGuard,
 ) -> Result<()> {
-    if selected.is_empty() {
-        return Ok(());
+    let workers = crate::parallel::worker_count(sections.len(), 1).max(1);
+    for wave in sections.chunks(workers) {
+        let layouts: Vec<GroupLayout> = wave
+            .iter()
+            .map(|job| group_channel_layout(partial, selected, job.rect))
+            .collect();
+        let share = guard.remaining() / u64::try_from(wave.len()).unwrap_or(u64::MAX).max(1);
+        let mut slots: Vec<Option<(Result<Option<ModularImage>>, u64)>> =
+            (0..wave.len()).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            for ((slot, job), (specs, _)) in slots.iter_mut().zip(wave).zip(&layouts) {
+                scope.spawn(move || {
+                    let mut budget = AllocGuard::new(&Limits {
+                        max_alloc_bytes: share,
+                        ..Limits::relaxed()
+                    });
+                    let decoded = decode_group_image(
+                        codestream,
+                        base,
+                        toc,
+                        job,
+                        specs,
+                        global_tree,
+                        options,
+                        &mut budget,
+                    );
+                    *slot = Some((decoded, budget.charged()));
+                });
+            }
+        });
+        for ((slot, job), (specs, origins)) in slots.iter_mut().zip(wave).zip(layouts) {
+            let decoded = match slot.take() {
+                Some((Ok(decoded), charged)) if charged <= guard.remaining() => {
+                    guard.charge(charged)?;
+                    decoded
+                }
+                _ => decode_group_image(
+                    codestream,
+                    base,
+                    toc,
+                    job,
+                    &specs,
+                    global_tree,
+                    options,
+                    guard,
+                )?,
+            };
+            if let Some(decoded) = decoded {
+                scatter_group_channels(partial, selected, &origins, decoded);
+            }
+        }
     }
+    Ok(())
+}
 
+/// The reading half of [`decode_group_section`] for one multi-section group:
+/// its decoded channels, or `None` for an empty section (which the serial
+/// path skips without reading).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one group's slice of the serial loop's inputs"
+)]
+fn decode_group_image(
+    codestream: &[u8],
+    base: usize,
+    toc: &Toc,
+    job: &GroupSection,
+    specs: &[ChannelSpec],
+    global_tree: Option<&GlobalTree>,
+    options: &ModularOptions,
+    guard: &mut AllocGuard,
+) -> Result<Option<ModularImage>> {
+    let slice = section_slice(codestream, base, toc, job.section)?;
+    if slice.is_empty() {
+        return Ok(None);
+    }
+    let mut reader = BitReader::new(slice);
+    let options = ModularOptions {
+        stream_index: job.stream_index,
+        ..*options
+    };
+    let source = tree_source(global_tree, true);
+    Ok(Some(decode_sub_bitstream_with(
+        &mut reader,
+        specs,
+        &options,
+        source,
+        guard,
+    )?))
+}
+
+/// One group's channel shapes and their origins in the frame-wide channels.
+type GroupLayout = (Vec<ChannelSpec>, Vec<(u32, u32)>);
+
+/// G.2.3 / G.4.2: the shapes one group decodes its selected channels into,
+/// and where each lands in the frame-wide channel.
+fn group_channel_layout(
+    partial: &crate::modular::PartialModular,
+    selected: &[usize],
+    rect: Rect,
+) -> GroupLayout {
     let mut specs = Vec::with_capacity(selected.len());
     let mut origins = Vec::with_capacity(selected.len());
     for &i in selected {
@@ -2196,12 +2341,17 @@ fn decode_group_channels(
         ));
         origins.push((x0, y0));
     }
+    (specs, origins)
+}
 
-    let source = tree_source(global_tree, true);
-    let decoded = decode_sub_bitstream_with(reader, &specs, options, source, guard)?;
-
-    // "The decoded modular group data is then copied into the partially
-    // decoded GlobalModular image in the corresponding positions."
+/// "The decoded modular group data is then copied into the partially
+/// decoded GlobalModular image in the corresponding positions."
+fn scatter_group_channels(
+    partial: &mut crate::modular::PartialModular,
+    selected: &[usize],
+    origins: &[(u32, u32)],
+    decoded: ModularImage,
+) {
     let channels = decoded.into_channels();
     for ((&target, source_channel), &(x0, y0)) in
         selected.iter().zip(channels.iter()).zip(origins.iter())
@@ -2210,11 +2360,37 @@ fn decode_group_channels(
             continue;
         };
         for y in 0..source_channel.height() {
-            for x in 0..source_channel.width() {
-                dest.set(x0 + x, y0 + y, source_channel.get(x, y));
-            }
+            dest.write_row(x0, y0 + y, source_channel.row(y));
         }
     }
+}
+
+/// One LF-group or pass-group modular sub-bitstream, read from `reader` at its
+/// current position and copied back into the frame-wide channel list.
+///
+/// Split from [`decode_group_section`] because a `kVarDCT` frame reaches the
+/// same two sub-bitstreams (G.2.3, G.4.2) from the middle of a section it is
+/// already reading — `ModularLfGroup` sits between `LfQuant` and `HfMetadata`,
+/// and `Modular group data` follows the HF coefficients — so it has a reader
+/// but no section index. G.2.3 and G.4.2 are one code path for both encodings;
+/// only the channel selection differs, and that is the caller's.
+fn decode_group_channels(
+    reader: &mut BitReader<'_>,
+    partial: &mut crate::modular::PartialModular,
+    selected: &[usize],
+    rect: Rect,
+    global_tree: Option<&GlobalTree>,
+    options: &ModularOptions,
+    guard: &mut AllocGuard,
+) -> Result<()> {
+    if selected.is_empty() {
+        return Ok(());
+    }
+
+    let (specs, origins) = group_channel_layout(partial, selected, rect);
+    let source = tree_source(global_tree, true);
+    let decoded = decode_sub_bitstream_with(reader, &specs, options, source, guard)?;
+    scatter_group_channels(partial, selected, &origins, decoded);
     Ok(())
 }
 
@@ -2370,6 +2546,114 @@ struct LfGroupState {
 }
 
 /// One pass group's decoded HF coefficients, held until every pass is in.
+/// One pass group's decoded HF read: the section reader positioned after
+/// the coefficients, and the bytes the group charged.
+type HfOutcome<'a> = (Result<BitReader<'a>>, u64);
+
+/// One pass group's HF section, prepared serially for the worker pool.
+struct HfGroupJob {
+    rect: Rect,
+    section: usize,
+    params: crate::vardct::hf_coeff::HfGroupParams,
+    ec_options: ModularOptions,
+}
+
+/// I.4 for every group of one pass of a multi-section frame, on a
+/// `std::thread::scope` pool. Returns, per group in group order, the
+/// section reader positioned after the HF coefficients (where G.4.2's
+/// modular group data starts) and the bytes the group charged.
+///
+/// **Same coefficients as the serial loop, by construction.** Each group
+/// has its own TOC section and reader and its own `GroupState`, and its
+/// coefficients depend only on those, the pass's read-only orders and
+/// block-context model, and the pass's histograms *as `restart` leaves
+/// them*. `restart` re-initializes the only state a read mutates — the ANS
+/// state and the LZ77 window — so each worker's clone of the histograms,
+/// restarted at every group, decodes exactly what the shared decoder does.
+///
+/// Each worker meters its groups against a copy of the guard as the pass
+/// found it, which has at least the headroom the serial decode would have
+/// had at each of those groups; the caller replays every group's charge into
+/// the real guard in group order, before that group's modular data, and
+/// returns the first error in group order — so a decode that succeeds
+/// serially succeeds here with the same charges, and one that fails, fails
+/// at the same group. The workers' transient overshoot is bounded by one
+/// non-zeros grid per worker.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the serial loop's per-pass inputs, passed through unchanged"
+)]
+fn decode_hf_groups_threaded<'a>(
+    codestream: &'a [u8],
+    base: usize,
+    toc: &Toc,
+    jobs: &[HfGroupJob],
+    groups: &mut [GroupState],
+    orders: &crate::vardct::order::OrderLookup<'_>,
+    histograms: &jpxl_entropy::SymbolDecoder,
+    model: &crate::vardct::block_ctx::HfBlockContext,
+    guard: &AllocGuard,
+) -> Vec<HfOutcome<'a>> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let states: Vec<Mutex<&mut GroupState>> = groups.iter_mut().map(Mutex::new).collect();
+    let slots: Vec<Mutex<Option<HfOutcome<'a>>>> = jobs.iter().map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let workers = crate::parallel::worker_count(jobs.len(), 1);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let mut decoder = histograms.clone();
+                let mut budget = *guard;
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let (Some(job), Some(state), Some(slot)) =
+                        (jobs.get(i), states.get(i), slots.get(i))
+                    else {
+                        break;
+                    };
+                    let before = budget.charged();
+                    let decoded = (|| -> Result<BitReader<'a>> {
+                        let mut state = state
+                            .lock()
+                            .map_err(|_| unsupported("a poisoned group state", "18181-1 G.4"))?;
+                        let state = &mut **state;
+                        let mut reader =
+                            BitReader::new(section_slice(codestream, base, toc, job.section)?);
+                        crate::vardct::hf_coeff::decode_hf_group(
+                            &mut reader,
+                            &job.params,
+                            &state.varblocks,
+                            orders,
+                            &mut decoder,
+                            model,
+                            &mut state.coefficients,
+                            &mut budget,
+                        )?;
+                        Ok(reader)
+                    })();
+                    let charged = budget.charged().saturating_sub(before);
+                    if let Ok(mut slot) = slot.lock() {
+                        *slot = Some((decoded, charged));
+                    }
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner().ok().flatten().unwrap_or_else(|| {
+                (
+                    Err(unsupported("a pass group no worker decoded", "18181-1 G.4")),
+                    0,
+                )
+            })
+        })
+        .collect()
+}
+
 struct GroupState {
     /// Index into `geometry.group_rect`.
     group: u64,
@@ -2814,6 +3098,7 @@ fn decode_vardct_frame(
             &ec_decoded_in_pass,
         );
 
+        let mut hf_jobs: Vec<HfGroupJob> = Vec::new();
         for group in 0..num_groups {
             let rect = geometry
                 .group_rect(group)
@@ -2879,19 +3164,6 @@ fn decode_vardct_frame(
                 .ok_or_else(|| unsupported("a group index past the grid", "18181-1 G.4"))?;
 
             let section = 2 + num_lf_groups + num_groups * u64::from(pass) + group;
-            let mut owned;
-            let reader: &mut BitReader<'_> = if single {
-                &mut single_reader
-            } else {
-                owned = BitReader::new(section_slice(
-                    codestream,
-                    base,
-                    toc,
-                    usize::try_from(section).unwrap_or(0),
-                )?);
-                &mut owned
-            };
-
             let group_params = HfGroupParams {
                 shift: header.passes.shift_for(pass),
                 blocks_w,
@@ -2902,6 +3174,21 @@ fn decode_vardct_frame(
                 // zero regardless of the thresholds.
                 lf_idx_is_zero: use_lf_frame,
             };
+            let ec_options = ModularOptions {
+                stream_index: stream_index_of::modular_group(geometry, u64::from(pass), group)?,
+                ..modular_options
+            };
+            if !single {
+                // Decoded below, on the worker pool.
+                hf_jobs.push(HfGroupJob {
+                    rect,
+                    section: usize::try_from(section).unwrap_or(0),
+                    params: group_params,
+                    ec_options,
+                });
+                continue;
+            }
+            let reader = &mut single_reader;
             let (orders, histograms) = passes.split_pass(pass as usize)?;
             decode_hf_group(
                 reader,
@@ -2916,10 +3203,6 @@ fn decode_vardct_frame(
 
             // G.4.2 modular group data, in the same section and immediately
             // after the HF coefficients (Table G.5's second row).
-            let ec_options = ModularOptions {
-                stream_index: stream_index_of::modular_group(geometry, u64::from(pass), group)?,
-                ..modular_options
-            };
             decode_group_channels(
                 reader,
                 &mut ec_partial,
@@ -2929,6 +3212,37 @@ fn decode_vardct_frame(
                 &ec_options,
                 guard,
             )?;
+        }
+        if !single {
+            let (orders, histograms) = passes.split_pass(pass as usize)?;
+            let outcomes = decode_hf_groups_threaded(
+                codestream,
+                base,
+                toc,
+                &hf_jobs,
+                &mut groups,
+                &orders,
+                histograms,
+                &vardct.hf_block_ctx,
+                guard,
+            );
+            for (job, (decoded, charged)) in hf_jobs.iter().zip(outcomes) {
+                let mut reader = decoded?;
+                guard.charge(charged)?;
+                // G.4.2 modular group data, in the same section and
+                // immediately after the HF coefficients (Table G.5's second
+                // row), read serially in group order from where the worker's
+                // HF read stopped.
+                decode_group_channels(
+                    &mut reader,
+                    &mut ec_partial,
+                    &ec_selected,
+                    job.rect,
+                    global_tree.as_ref(),
+                    &job.ec_options,
+                    guard,
+                )?;
+            }
         }
         for &i in &ec_selected {
             if let Some(slot) = ec_decoded_in_pass.get_mut(i) {
@@ -2953,8 +3267,9 @@ fn decode_vardct_frame(
     )?;
 
     // ---- I.5.3, I.6, I.8, I.9 -------------------------------------------
+    let matrix_cache = render::DequantMatrixCache::new(&hf_params.matrices);
     let dequant = render::HfDequantParams {
-        matrices: &hf_params.matrices,
+        matrices: &matrix_cache,
         quant_bias: opsin(metadata).quant_bias,
         quant_bias_numerator: opsin(metadata).quant_bias_numerator,
         global_scale: vardct.quantizer.global_scale,

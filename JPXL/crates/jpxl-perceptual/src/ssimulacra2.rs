@@ -107,8 +107,7 @@ impl Ssimulacra2 {
             debug_assert_eq!((w, h), (rs.width, rs.height));
             let pixels = w * h;
             for plane in self.xyb.iter_mut() {
-                plane.clear();
-                plane.resize(pixels, 0.0);
+                crate::bands::zeroed_in_place(plane, pixels);
             }
             {
                 let src: [&[f32]; 3] = if scale == 0 {
@@ -189,8 +188,7 @@ impl Ssimulacra2 {
             debug_assert_eq!((w, h), (rs.width, rs.height));
             let pixels = w * h;
             for plane in self.xyb.iter_mut() {
-                plane.clear();
-                plane.resize(pixels, 0.0);
+                crate::bands::zeroed_in_place(plane, pixels);
             }
             {
                 let [cr, cg, cb] = &self.cur_rgb;
@@ -271,8 +269,7 @@ impl Ssimulacra2 {
             debug_assert_eq!((w, h), (rs.width, rs.height));
             let pixels = w * h;
             for plane in self.xyb.iter_mut() {
-                plane.clear();
-                plane.resize(pixels, 0.0);
+                crate::bands::zeroed_in_place(plane, pixels);
             }
             {
                 let src: [&[f32]; 3] = if scale == 1 {

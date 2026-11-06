@@ -132,8 +132,14 @@ impl Blur {
             return;
         }
         // The horizontal pass writes every temp sample, so a reused temp needs
-        // no re-zeroing; resize only grows (zeroed) or truncates.
-        self.temp.resize(width * height, 0.0);
+        // no re-zeroing; resize only grows (zeroed) or truncates. A first use
+        // takes the lazily zeroed allocation (identical zeros) so the pages
+        // are first touched by the band workers, not serially here.
+        if self.temp.is_empty() {
+            self.temp = vec![0.0; width * height];
+        } else {
+            self.temp.resize(width * height, 0.0);
+        }
         let band_len = width.saturating_mul(BAND_ROWS);
         let bands = mutable_bands(vec![self.temp.as_mut_slice()], band_len);
         executor.run(bands.len(), &|index| {

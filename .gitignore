@@ -44,3 +44,7 @@ __pycache__/
 
 # Agent-pack snapshot archives (regenerable exports, never history).
 /jpegXL-rs-agent-pack-*.7z
+
+# Agent scratch space (raw run logs, A/B harness output, scratch corpora).
+# AGENTS.md documents .agent/scratch/ as gitignored; enforce it here.
+.agent/

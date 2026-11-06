@@ -192,6 +192,22 @@ impl Channel {
         }
     }
 
+    /// Writes `values` to row `y` starting at column `x0`, clipping exactly
+    /// as a [`Channel::set`] per sample would: samples past the right edge,
+    /// and whole rows past the bottom, are dropped.
+    pub fn write_row(&mut self, x0: u32, y: u32, values: &[i32]) {
+        if x0 >= self.spec.width || y >= self.spec.height {
+            return;
+        }
+        let width = self.spec.width as usize;
+        let start = y as usize * width + x0 as usize;
+        let len = values.len().min(width - x0 as usize);
+        if let (Some(dest), Some(src)) = (self.data.get_mut(start..start + len), values.get(..len))
+        {
+            dest.copy_from_slice(src);
+        }
+    }
+
     /// One row of samples, or an empty slice if `y` is out of range.
     #[must_use]
     pub fn row(&self, y: u32) -> &[i32] {

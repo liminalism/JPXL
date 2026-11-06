@@ -164,6 +164,46 @@ pub enum TreeNode {
     Leaf(Leaf),
 }
 
+/// Table H.4 property 8: `W - (W' + N' - NW')`, the gradient error at the
+/// west neighbour — the one property that reads another sample's neighbours.
+const PROPERTY_WEST_GRADIENT_ERROR: usize = 8;
+
+/// Table H.4 property 15: the H.5.1 self-correcting predictor's `max_error`.
+const PROPERTY_MAX_ERROR: usize = 15;
+
+/// What [`MaTree::usage`] found a tree can observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeUsage {
+    /// A leaf predicts with the self-correcting predictor, or a decision tests
+    /// its `max_error` (property 15): H.5.1 must run for every sample.
+    pub weighted: bool,
+    /// A decision tests property 8.
+    pub west_gradient_error: bool,
+    /// A decision tests a previous-channel property (index 16 and up).
+    pub previous_channels: bool,
+}
+
+impl Default for TreeUsage {
+    /// Nothing observed — the state of an empty scan, not a safe default for
+    /// an unknown tree (that is [`TreeUsage::ALL`]).
+    fn default() -> Self {
+        Self {
+            weighted: false,
+            west_gradient_error: false,
+            previous_channels: false,
+        }
+    }
+}
+
+impl TreeUsage {
+    /// Every input observed: the full H.3 computation.
+    pub const ALL: Self = Self {
+        weighted: true,
+        west_gradient_error: true,
+        previous_channels: true,
+    };
+}
+
 /// A decoded MA tree (H.4.2), validated and ready to traverse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaTree {
@@ -209,6 +249,33 @@ impl MaTree {
     #[must_use]
     pub const fn depth(&self) -> u32 {
         self.depth
+    }
+
+    /// Which per-sample inputs a traversal of this tree, and its leaves'
+    /// predictors, can observe.
+    ///
+    /// H.3 computes the full property vector and runs the H.5.1 self-
+    /// correcting predictor for every sample, but a value no decision node
+    /// tests and no leaf predicts from cannot change a decoded sample. The
+    /// decoder uses this to skip exactly that unobservable work; the samples
+    /// it produces are unchanged.
+    #[must_use]
+    pub fn usage(&self) -> TreeUsage {
+        let mut usage = TreeUsage::default();
+        for node in &self.nodes {
+            match node {
+                TreeNode::Leaf(leaf) => {
+                    usage.weighted |= leaf.predictor == Predictor::SelfCorrecting;
+                }
+                TreeNode::Decision { property, .. } => {
+                    let property = *property as usize;
+                    usage.weighted |= property == PROPERTY_MAX_ERROR;
+                    usage.west_gradient_error |= property == PROPERTY_WEST_GRADIENT_ERROR;
+                    usage.previous_channels |= property >= NUM_STATIC_PROPERTIES;
+                }
+            }
+        }
+        usage
     }
 
     /// `MA(properties)`: walks the tree and returns the selected leaf (H.4.1).
@@ -422,6 +489,9 @@ pub struct PropertyBuilder {
     /// iteration order (descending index).
     previous: Vec<usize>,
     values: Vec<i32>,
+    /// Which optional properties [`PropertyBuilder::compute`] fills; see
+    /// [`PropertyBuilder::observing`].
+    usage: TreeUsage,
 }
 
 impl PropertyBuilder {
@@ -460,7 +530,21 @@ impl PropertyBuilder {
             stream_index: narrow_to_i32(i64::from(stream_index)),
             previous,
             values: vec![0; len],
+            usage: TreeUsage::ALL,
         })
+    }
+
+    /// Restricts [`PropertyBuilder::compute`] to the properties `usage` says
+    /// the tree can observe.
+    ///
+    /// Property 8 and the previous-channel properties are left at zero when
+    /// no decision node tests them. [`MaTree::traverse`] reads only the
+    /// properties its decision nodes name, so the leaf it selects — and so
+    /// every decoded sample — is the same as with the full vector.
+    #[must_use]
+    pub const fn observing(mut self, usage: TreeUsage) -> Self {
+        self.usage = usage;
+        self
     }
 
     /// Length of the property vector this builder produces.
@@ -497,7 +581,9 @@ impl PropertyBuilder {
         // Property 9 evaluated at (x - 1, y). H.4.1 defines property 8 in terms
         // of it, and it is the only property that looks at another sample's
         // property vector.
-        let west_gradient_error = if x > 0 {
+        let west_gradient_error = if !self.usage.west_gradient_error {
+            0
+        } else if x > 0 {
             let left = Neighbours::gather(current, x - 1, y);
             nb.w - (left.w + left.n - left.nw)
         } else {
@@ -526,6 +612,9 @@ impl PropertyBuilder {
             *slot = narrow_to_i32(*value);
         }
 
+        if !self.usage.previous_channels {
+            return &self.values;
+        }
         let mut k = NUM_STATIC_PROPERTIES;
         for &j in &self.previous {
             let Some(other) = earlier.get(j) else {
@@ -587,6 +676,72 @@ mod tests {
             offset: 0,
             multiplier: 1,
         })
+    }
+
+    #[test]
+    fn usage_reports_exactly_what_the_tree_can_observe() {
+        // Proves the skip conditions decode_channels relies on: the weighted
+        // predictor is needed iff a leaf predicts with it or a decision
+        // tests property 15; property 8 and the previous-channel properties
+        // iff a decision tests them. Anything less would let the decoder skip
+        // an observable value.
+        let decide = |property: u32| -> MaTree {
+            MaTree {
+                nodes: vec![
+                    TreeNode::Decision {
+                        property,
+                        value: 0,
+                        left: 1,
+                        right: 2,
+                    },
+                    leaf(0),
+                    leaf(1),
+                ],
+                num_leaves: 2,
+                depth: 1,
+            }
+        };
+        let none = TreeUsage::default();
+        for p in [0, 1, 2, 7, 9, 14] {
+            assert_eq!(decide(p).usage(), none, "property {p}");
+        }
+        assert_eq!(
+            decide(8).usage(),
+            TreeUsage {
+                west_gradient_error: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            decide(15).usage(),
+            TreeUsage {
+                weighted: true,
+                ..none
+            }
+        );
+        for p in [16, 19, 400] {
+            assert_eq!(
+                decide(p).usage(),
+                TreeUsage {
+                    previous_channels: true,
+                    ..none
+                },
+                "property {p}"
+            );
+        }
+        // Every Table H.3 predictor but the self-correcting one leaves the
+        // weighted state unobservable.
+        for k in 0..14 {
+            let tree = MaTree::single_leaf(k, 0, 1).expect("valid predictor");
+            let weighted = Predictor::from_value(k).expect("valid") == Predictor::SelfCorrecting;
+            assert_eq!(tree.usage().weighted, weighted, "predictor {k}");
+        }
+        assert!(
+            MaTree::single_leaf(6, 0, 1)
+                .expect("valid")
+                .usage()
+                .weighted
+        );
     }
 
     #[test]

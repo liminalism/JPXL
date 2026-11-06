@@ -287,6 +287,95 @@ fn quantile(sorted: &[f64], q: f64) -> f64 {
 /// `pixel(i)` returns the `[r, g, b]` bytes of pixel `i` in raster order.
 /// `None` when the frame has no whole 32x32 cell.
 #[must_use]
+pub fn preanalysis_features(
+    width: u32,
+    height: u32,
+    pixel: impl Fn(usize) -> [u8; 3],
+) -> Option<PreanalysisFeatures> {
+    let (width, height) = (width as usize, height as usize);
+    if width / CELL == 0 || height / CELL == 0 {
+        return None;
+    }
+    let mut planes = YccPlanes::zeros(width * height);
+    planes.fill(0, &pixel);
+    features_from_planes(width, height, &planes, None)
+}
+
+/// [`preanalysis_features`] with the plane conversion and the per-cell
+/// statistics spread over `executor`'s workers.
+///
+/// **The same features as the serial function, by construction.** Both
+/// stages are pure integer functions of the pixels: the conversion is per
+/// pixel, and each cell's statistics read only the luma/chroma planes. The
+/// workers fill disjoint bands of the planes, then compute whole rows of
+/// cells, which are concatenated in raster order before the (unchanged,
+/// serial) float aggregation — so every sum, sort and quantile sees the
+/// serial pass's cell list exactly.
+fn preanalysis_features_with(
+    width: u32,
+    height: u32,
+    pixel: impl Fn(usize) -> [u8; 3] + Sync,
+    executor: &jpxl_encode::EncodeExecutor,
+) -> Option<PreanalysisFeatures> {
+    let (width, height) = (width as usize, height as usize);
+    if width / CELL == 0 || height / CELL == 0 {
+        return None;
+    }
+    let pixels = width * height;
+    let band = width.saturating_mul(CELL).max(1);
+    let bands = executor
+        .map_ordered(pixels.div_ceil(band), |index| {
+            let start = index * band;
+            let mut part = YccPlanes::zeros(band.min(pixels - start));
+            part.fill(start, &pixel);
+            Ok::<_, core::convert::Infallible>(part)
+        })
+        .ok()?;
+    let mut planes = YccPlanes::default();
+    for part in bands {
+        planes.luma.extend_from_slice(&part.luma);
+        planes.cb.extend_from_slice(&part.cb);
+        planes.cr.extend_from_slice(&part.cr);
+    }
+    features_from_planes(width, height, &planes, Some(executor))
+}
+
+/// The integer BT.601 planes the analysis runs on: 8-bit, rounded.
+#[derive(Default)]
+struct YccPlanes {
+    luma: Vec<u8>,
+    cb: Vec<u8>,
+    cr: Vec<u8>,
+}
+
+impl YccPlanes {
+    fn zeros(len: usize) -> Self {
+        Self {
+            luma: vec![0u8; len],
+            cb: vec![0u8; len],
+            cr: vec![0u8; len],
+        }
+    }
+
+    /// Converts pixels `first..first + self.len()` into the planes.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the BT.601 sums are shifted and clamped into 0..=255"
+    )]
+    fn fill(&mut self, first: usize, pixel: &impl Fn(usize) -> [u8; 3]) {
+        let rows = self.luma.iter_mut().zip(&mut self.cb).zip(&mut self.cr);
+        for (i, ((l, cb), cr)) in rows.enumerate() {
+            let [r, g, b] = pixel(first + i);
+            let (r, g, b) = (i32::from(r), i32::from(g), i32::from(b));
+            *l = ((77 * r + 150 * g + 29 * b + 128) >> 8) as u8;
+            *cb = (((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+            *cr = (((128 * r - 107 * g - 21 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// The per-cell statistics and their aggregation, over converted planes.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -294,44 +383,26 @@ fn quantile(sorted: &[f64], q: f64) -> f64 {
     clippy::too_many_lines,
     reason = "cell sums fit i64, the q8 shares are bounded by construction, and the pass is one straight-line loop"
 )]
-pub fn preanalysis_features(
-    width: u32,
-    height: u32,
-    pixel: impl Fn(usize) -> [u8; 3],
+fn features_from_planes(
+    width: usize,
+    height: usize,
+    planes: &YccPlanes,
+    executor: Option<&jpxl_encode::EncodeExecutor>,
 ) -> Option<PreanalysisFeatures> {
-    let width = width as usize;
-    let height = height as usize;
     let cells_x = width / CELL;
     let cells_y = height / CELL;
     if cells_x == 0 || cells_y == 0 {
         return None;
     }
-    // Integer BT.601 planes, 8-bit, rounded.
-    let pixels = width * height;
-    let mut luma = vec![0u8; pixels];
-    let mut cb = vec![0u8; pixels];
-    let mut cr = vec![0u8; pixels];
-    for i in 0..pixels {
-        let [r, g, b] = pixel(i);
-        let (r, g, b) = (i32::from(r), i32::from(g), i32::from(b));
-        if let Some(l) = luma.get_mut(i) {
-            *l = ((77 * r + 150 * g + 29 * b + 128) >> 8) as u8;
-        }
-        if let Some(c) = cb.get_mut(i) {
-            *c = (((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-        }
-        if let Some(c) = cr.get_mut(i) {
-            *c = (((128 * r - 107 * g - 21 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-        }
-    }
+    let (luma, cb, cr) = (&planes.luma, &planes.cb, &planes.cr);
     let lum = |x: i64, y: i64| -> i32 {
         let sx = x.clamp(0, width as i64 - 1) as usize;
         let sy = y.clamp(0, height as i64 - 1) as usize;
         luma.get(sy * width + sx).copied().map_or(0, i32::from)
     };
     let n = (CELL * CELL) as i64;
-    let mut cells: Vec<Cell> = Vec::with_capacity(cells_x * cells_y);
-    for cy in 0..cells_y {
+    let cell_row = |cy: usize| -> Vec<Cell> {
+        let mut cells: Vec<Cell> = Vec::with_capacity(cells_x);
         for cx in 0..cells_x {
             let x0 = (cx * CELL) as i64;
             let y0 = (cy * CELL) as i64;
@@ -425,7 +496,19 @@ pub fn preanalysis_features(
             cell.class = classify(&cell);
             cells.push(cell);
         }
-    }
+        cells
+    };
+    let cells: Vec<Cell> = match executor {
+        Some(executor) => executor
+            .map_ordered(cells_y, |cy| {
+                Ok::<_, core::convert::Infallible>(cell_row(cy))
+            })
+            .ok()?
+            .into_iter()
+            .flatten()
+            .collect(),
+        None => (0..cells_y).flat_map(cell_row).collect(),
+    };
 
     let count = cells.len() as f64;
     let mut share = [0.0f32; 7];
@@ -510,6 +593,26 @@ pub fn preanalysis_srgb8(width: u32, height: u32, rgb: &[u8]) -> Option<Preanaly
     })
 }
 
+/// [`preanalysis_srgb8`] spread over `executor`'s workers; the features are
+/// identical (see `preanalysis_features_with`).
+#[must_use]
+pub fn preanalysis_srgb8_with(
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    executor: &jpxl_encode::EncodeExecutor,
+) -> Option<PreanalysisFeatures> {
+    preanalysis_features_with(
+        width,
+        height,
+        |i| match rgb.get(3 * i..3 * i + 3) {
+            Some([r, g, b]) => [*r, *g, *b],
+            _ => [0, 0, 0],
+        },
+        executor,
+    )
+}
+
 /// [`preanalysis_features`] over interleaved samples wider than a byte,
 /// reduced to their top eight bits (as [`crate::content_class`] does).
 #[must_use]
@@ -519,16 +622,43 @@ pub fn preanalysis_srgb16(
     rgb: &[u16],
     bits_per_sample: u32,
 ) -> Option<PreanalysisFeatures> {
+    let reduce = reduce_to_8(bits_per_sample);
+    preanalysis_features(width, height, move |i| match rgb.get(3 * i..3 * i + 3) {
+        Some([r, g, b]) => [reduce(*r), reduce(*g), reduce(*b)],
+        _ => [0, 0, 0],
+    })
+}
+
+/// [`preanalysis_srgb16`] spread over `executor`'s workers; the features are
+/// identical (see `preanalysis_features_with`).
+#[must_use]
+pub fn preanalysis_srgb16_with(
+    width: u32,
+    height: u32,
+    rgb: &[u16],
+    bits_per_sample: u32,
+    executor: &jpxl_encode::EncodeExecutor,
+) -> Option<PreanalysisFeatures> {
+    let reduce = reduce_to_8(bits_per_sample);
+    preanalysis_features_with(
+        width,
+        height,
+        move |i| match rgb.get(3 * i..3 * i + 3) {
+            Some([r, g, b]) => [reduce(*r), reduce(*g), reduce(*b)],
+            _ => [0, 0, 0],
+        },
+        executor,
+    )
+}
+
+/// The top eight bits of a `bits_per_sample`-wide sample.
+fn reduce_to_8(bits_per_sample: u32) -> impl Fn(u16) -> u8 + Copy + Sync {
     let shift = bits_per_sample.saturating_sub(8);
     #[allow(
         clippy::cast_possible_truncation,
         reason = "the shift and min bring every sample into 0..=255"
     )]
-    let reduce = move |s: u16| (s >> shift).min(255) as u8;
-    preanalysis_features(width, height, move |i| match rgb.get(3 * i..3 * i + 3) {
-        Some([r, g, b]) => [reduce(*r), reduce(*g), reduce(*b)],
-        _ => [0, 0, 0],
-    })
+    move |s: u16| (s >> shift).min(255) as u8
 }
 
 #[cfg(test)]
@@ -593,6 +723,44 @@ mod tests {
         assert!(f.edge_mean > 0.0);
         assert!(f.chroma_log2_q90 > s.chroma_log2_q90);
         assert!(f.vector()[22] > s.vector()[22]);
+    }
+
+    #[test]
+    fn the_threaded_pass_matches_the_serial_one_exactly() {
+        // Proves preanalysis_*_with returns the serial features bit for bit
+        // at several worker counts, on a ragged frame (partial cells on both
+        // edges, a partial last plane band) with edges, flat areas, noise and
+        // chroma, for both sample widths.
+        let (w, h) = (203u32, 141u32);
+        let rgb: Vec<u8> = (0..w * h * 3)
+            .map(|i| {
+                let v = i.wrapping_mul(2_654_435_761) >> 13;
+                let (x, y) = ((i / 3) % w, (i / 3) / w);
+                if (x / 17 + y / 23) % 3 == 0 {
+                    40
+                } else {
+                    (v % 256) as u8
+                }
+            })
+            .collect();
+        let wide: Vec<u16> = rgb.iter().map(|&v| u16::from(v) << 4 | 0x9).collect();
+        let serial8 = preanalysis_srgb8(w, h, &rgb).expect("cells");
+        let serial16 = preanalysis_srgb16(w, h, &wide, 12).expect("cells");
+        for threads in [1, 2, 3, 4] {
+            let executor = jpxl_encode::EncodeResources::groups(threads).executor();
+            assert_eq!(
+                preanalysis_srgb8_with(w, h, &rgb, &executor),
+                Some(serial8),
+                "{threads} threads"
+            );
+            assert_eq!(
+                preanalysis_srgb16_with(w, h, &wide, 12, &executor),
+                Some(serial16),
+                "{threads} threads"
+            );
+        }
+        let executor = jpxl_encode::EncodeResources::groups(2).executor();
+        assert!(preanalysis_srgb8_with(31, 40, &vec![0u8; 31 * 40 * 3], &executor).is_none());
     }
 
     #[test]
