@@ -910,7 +910,9 @@ impl Encoder {
                     rgb,
                     Some(&executor),
                 )?
-                .with_preanalysis(jpxl_encode_policy::preanalysis_srgb8(width, height, rgb)),
+                .with_preanalysis(jpxl_encode_policy::preanalysis_srgb8_with(
+                    width, height, rgb, &executor,
+                )),
                 jpxl_perceptual::PlanRenderEvaluator::from_srgb8(width, height, rgb, &executor)
                     .map_err(|_| {
                         Error::Unsupported("the frame cannot be scored by the perceptual metric")
@@ -929,11 +931,12 @@ impl Encoder {
                     bits_per_sample,
                     Some(&executor),
                 )?
-                .with_preanalysis(jpxl_encode_policy::preanalysis_srgb16(
+                .with_preanalysis(jpxl_encode_policy::preanalysis_srgb16_with(
                     width,
                     height,
                     rgb,
                     bits_per_sample,
+                    &executor,
                 )),
                 jpxl_perceptual::PlanRenderEvaluator::from_srgb16(
                     width,
