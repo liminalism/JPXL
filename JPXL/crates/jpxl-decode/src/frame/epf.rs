@@ -436,9 +436,23 @@ pub fn epf_weight(
     if scaled_distance == 0.0 {
         return 1.0;
     }
-    // 4 * (1 - sqrt(0.5)) is the clause's constant, written out rather than
-    // pre-multiplied so it reads as J.4.3 does.
-    let inv_sigma = step.step_multiplier(params) * 4.0 * (1.0 - 0.5f32.sqrt()) / sigma;
+    weight_from_scaled(scaled_distance, epf_inv_sigma(sigma, step, params))
+}
+
+/// J.4.3's `inv_sigma` for one block and step.
+///
+/// 4 * (1 - sqrt(0.5)) is the clause's constant, written out rather than
+/// pre-multiplied so it reads as J.4.3 does. A pure function of the block, so
+/// the lane path evaluates it once per block row instead of once per tap;
+/// the expression (and so every rounding) is the one [`epf_weight`] uses.
+#[inline(always)]
+fn epf_inv_sigma(sigma: f32, step: EpfStep, params: &EpfParams) -> f32 {
+    step.step_multiplier(params) * 4.0 * (1.0 - 0.5f32.sqrt()) / sigma
+}
+
+/// The tail of J.4.3 `Weight()` for a non-zero scaled distance.
+#[inline(always)]
+fn weight_from_scaled(scaled_distance: f32, inv_sigma: f32) -> f32 {
     let v = scaled_distance.mul_add(-inv_sigma, 1.0);
     if v > 0.0 { v } else { 0.0 }
 }
@@ -643,13 +657,12 @@ fn epf_step_rows(
     epf_step_rows_impl(ctx, sigma, kernel, band, out);
 }
 
-/// [`epf_step_rows`] compiled for AVX2+FMA.
+/// [`epf_step_rows_lanes`] compiled for AVX2+FMA.
 ///
-/// Scalar fused instructions, not packed lanes: the win is fusing the
-/// loop's dozens of `mul_add`s per pixel into hardware (the baseline build
-/// calls the `fmaf` libcall per tap). Calling it is `unsafe` unless the
-/// host supports AVX2+FMA (see [`jpxl_core::cpu::has_fma`]); that is the
-/// whole contract.
+/// The lane path's fixed eight-wide loops become packed AVX2 arithmetic and
+/// its `mul_add`s hardware FMAs (the baseline build calls the `fmaf` libcall
+/// per tap). Calling it is `unsafe` unless the host supports AVX2+FMA (see
+/// [`jpxl_core::cpu::has_fma`]); that is the whole contract.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 fn epf_step_rows_fma(
@@ -659,7 +672,200 @@ fn epf_step_rows_fma(
     band: std::ops::Range<usize>,
     out: [&mut [f32]; 3],
 ) {
-    epf_step_rows_impl(ctx, sigma, kernel, band, out);
+    epf_step_rows_lanes(ctx, sigma, kernel, band, out);
+}
+
+/// Lane count of [`epf_step_rows_lanes`]: one block row.
+const LANES: usize = BLOCK_DIM;
+
+/// [`epf_step_rows_impl`] with the interior computed one block row (eight
+/// pixels) at a time.
+///
+/// **Bit-identical to the scalar reference by construction.** Each lane is
+/// one pixel and performs exactly the reference's IEEE operations in the
+/// reference's order: taps in kernel order, channels in order, cross offsets
+/// in order, the same `mul_add`s, the same weight clamp and the same final
+/// division. Only *which pixel goes next* changes, and no value flows
+/// between pixels, so no rounding can move. What the restructuring buys is
+/// that the per-pixel constants (block sigma, `inv_sigma`, the skip test,
+/// the border multiplier) are evaluated once per block row, the reads are
+/// contiguous slices instead of per-tap coordinate arithmetic, and the
+/// eight-wide loops vectorize in the AVX2+FMA build.
+///
+/// A block row takes the lane path only when all eight pixels are interior
+/// for this step's read margin (and the border SAD is evaluated at the
+/// reference pixel, which makes it a per-lane constant); every other pixel
+/// runs the reference's per-pixel body, [`filter_pixel`], unchanged.
+#[inline(always)]
+fn epf_step_rows_lanes(
+    ctx: &StepCtx,
+    sigma: &SigmaField,
+    kernel: &[(i64, i64)],
+    band: std::ops::Range<usize>,
+    mut out: [&mut [f32]; 3],
+) {
+    let dims = ctx.dims;
+    let margin = ctx.step.read_margin();
+    for (rel_y, y) in band.enumerate() {
+        let row_interior = y >= margin && y < dims.height.saturating_sub(margin);
+        let mut x0 = 0;
+        while x0 < dims.width {
+            let end = x0.saturating_add(LANES).min(dims.width);
+            let lanes_ok = EPF_BORDER_SAD_AT_REFERENCE_PIXEL
+                && row_interior
+                && end - x0 == LANES
+                && x0 >= margin
+                && end <= dims.width.saturating_sub(margin);
+            if !lanes_ok || !filter_block_row(ctx, sigma, kernel, x0, y, rel_y, &mut out) {
+                for x in x0..end {
+                    filter_pixel(ctx, sigma, kernel, x, y, rel_y, &mut out);
+                }
+            }
+            x0 = end;
+        }
+    }
+}
+
+/// One interior block row of [`epf_step_rows_lanes`]: pixels `x0..x0 + 8` of
+/// row `y`, with `x0` a multiple of 8.
+///
+/// Returns `false` without writing if a slice falls outside a plane (which
+/// the caller's interior test rules out); the caller then runs the reference
+/// body on those pixels, so the result is the same either way.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "every index is a `0..LANES` loop counter into a `[f32; LANES]` \
+              array, so the bound is a compile-time fact; the plane reads \
+              go through `lanes_at`, which is checked"
+)]
+#[inline(always)]
+fn filter_block_row(
+    ctx: &StepCtx,
+    sigma: &SigmaField,
+    kernel: &[(i64, i64)],
+    x0: usize,
+    y: usize,
+    rel_y: usize,
+    out: &mut [&mut [f32]; 3],
+) -> bool {
+    let w = ctx.dims.width;
+    let (bx, by) = (x0 / BLOCK_DIM, y / BLOCK_DIM);
+    let out_at = rel_y.saturating_mul(w).saturating_add(x0);
+
+    if sigma.skip_sigma_at(bx, by) < EPF_SIGMA_SKIP_THRESHOLD {
+        // J.4.3: the step's output is its input on this block.
+        let at = y.saturating_mul(w).saturating_add(x0);
+        for c in 0..3 {
+            let src = ctx.input.get(c).and_then(|p| lanes_at(p, at));
+            let dst = out
+                .get_mut(c)
+                .and_then(|p| p.get_mut(out_at..out_at + LANES));
+            let (Some(src), Some(dst)) = (src, dst) else {
+                return false;
+            };
+            dst.copy_from_slice(src);
+        }
+        return true;
+    }
+
+    let inv_sigma = epf_inv_sigma(sigma.sigma_at(bx, by), ctx.step, ctx.params);
+    // J.4.3's border multiplier at the reference pixel: lanes 0 and 7 sit on
+    // a block column edge, and every lane does when the row is a block edge.
+    let row_on_edge = matches!(y % BLOCK_DIM, 0 | 7);
+    let pm: [f32; LANES] = std::array::from_fn(|l| {
+        if row_on_edge || l == 0 || l == LANES - 1 {
+            ctx.params.border_sad_mul
+        } else {
+            1.0
+        }
+    });
+    let scales: [f32; 3] = std::array::from_fn(|c| ctx.channel_scale(c));
+    // Plane offset of (x0 + dx, y + dy); the interior test keeps it in range.
+    let offset = |dx: i64, dy: i64| -> Option<usize> {
+        let row = i64::try_from(y).ok()?.checked_add(dy)?;
+        let col = i64::try_from(x0).ok()?.checked_add(dx)?;
+        let at = row.checked_mul(i64::try_from(w).ok()?)?.checked_add(col)?;
+        usize::try_from(at).ok()
+    };
+
+    let mut sum_weights = [0.0f32; LANES];
+    let mut sum_channels = [[0.0f32; LANES]; 3];
+    for (cx, cy) in kernel.iter().copied() {
+        let mut dist = [0.0f32; LANES];
+        for (c, scale) in scales.iter().copied().enumerate() {
+            let Some(guide) = ctx.guide.get(c).copied() else {
+                return false;
+            };
+            if ctx.step == EpfStep::Step2 {
+                let a = offset(0, 0).and_then(|at| lanes_at(guide, at));
+                let b = offset(cx, cy).and_then(|at| lanes_at(guide, at));
+                let (Some(a), Some(b)) = (a, b) else {
+                    return false;
+                };
+                for l in 0..LANES {
+                    let d = a[l] - b[l];
+                    dist[l] = d.abs().mul_add(scale, dist[l]);
+                }
+            } else {
+                for (ix, iy) in CROSS_COORDS {
+                    let a = offset(ix, iy).and_then(|at| lanes_at(guide, at));
+                    let b = offset(cx + ix, cy + iy).and_then(|at| lanes_at(guide, at));
+                    let (Some(a), Some(b)) = (a, b) else {
+                        return false;
+                    };
+                    for l in 0..LANES {
+                        let d = a[l] - b[l];
+                        dist[l] = d.abs().mul_add(scale, dist[l]);
+                    }
+                }
+            }
+        }
+
+        let mut weight = [0.0f32; LANES];
+        for l in 0..LANES {
+            let scaled = pm[l] * dist[l];
+            weight[l] = if scaled == 0.0 {
+                1.0
+            } else {
+                weight_from_scaled(scaled, inv_sigma)
+            };
+            sum_weights[l] += weight[l];
+        }
+        for (c, acc) in sum_channels.iter_mut().enumerate() {
+            let input = ctx
+                .input
+                .get(c)
+                .copied()
+                .and_then(|p| offset(cx, cy).and_then(|at| lanes_at(p, at)));
+            let Some(input) = input else {
+                return false;
+            };
+            for l in 0..LANES {
+                acc[l] = input[l].mul_add(weight[l], acc[l]);
+            }
+        }
+    }
+
+    for (c, acc) in sum_channels.iter().enumerate() {
+        let Some(dst) = out
+            .get_mut(c)
+            .and_then(|p| p.get_mut(out_at..out_at + LANES))
+        else {
+            return false;
+        };
+        for (slot, (a, sw)) in dst.iter_mut().zip(acc.iter().zip(sum_weights.iter())) {
+            // sum_weights >= 1, as in the reference.
+            *slot = a / sw;
+        }
+    }
+    true
+}
+
+/// Eight consecutive samples of `plane` from `at`, as a fixed-size array so
+/// the lane loops compile without per-element bounds checks.
+#[inline(always)]
+fn lanes_at(plane: &[f32], at: usize) -> Option<&[f32; LANES]> {
+    plane.get(at..at.checked_add(LANES)?)?.try_into().ok()
 }
 
 /// The band loop itself: the readable scalar reference and the lock-step
@@ -677,56 +883,71 @@ fn epf_step_rows_impl(
     band: std::ops::Range<usize>,
     mut out: [&mut [f32]; 3],
 ) {
+    for (rel_y, y) in band.enumerate() {
+        for x in 0..ctx.dims.width {
+            filter_pixel(ctx, sigma, kernel, x, y, rel_y, &mut out);
+        }
+    }
+}
+
+/// The J.4.1–J.4.4 body for one output pixel `(x, y)`, writing row `rel_y`
+/// of the band. The reference [`epf_step_rows_impl`] runs it on every pixel;
+/// [`epf_step_rows_lanes`] on the pixels its block rows do not cover.
+#[inline(always)]
+fn filter_pixel(
+    ctx: &StepCtx,
+    sigma: &SigmaField,
+    kernel: &[(i64, i64)],
+    x: usize,
+    y: usize,
+    rel_y: usize,
+    out: &mut [&mut [f32]; 3],
+) {
     let dims = ctx.dims;
     let margin = ctx.step.read_margin();
-    for (rel_y, y) in band.enumerate() {
-        for x in 0..dims.width {
-            let idx = rel_y.saturating_mul(dims.width).saturating_add(x);
-            let (bx, by) = (x / BLOCK_DIM, y / BLOCK_DIM);
-            let interior = interior_pixel(x, y, dims, margin);
+    let idx = rel_y.saturating_mul(dims.width).saturating_add(x);
+    let (bx, by) = (x / BLOCK_DIM, y / BLOCK_DIM);
+    let interior = interior_pixel(x, y, dims, margin);
 
-            if sigma.skip_sigma_at(bx, by) < EPF_SIGMA_SKIP_THRESHOLD {
-                // J.4.3: the step's output is its input on this block.
-                for c in 0..3 {
-                    let input_idx = y.saturating_mul(dims.width).saturating_add(x);
-                    let v = ctx.input.get(c).and_then(|p| p.get(input_idx)).copied();
-                    if let (Some(v), Some(slot)) = (v, out.get_mut(c).and_then(|p| p.get_mut(idx)))
-                    {
-                        *slot = v;
-                    }
-                }
-                continue;
+    if sigma.skip_sigma_at(bx, by) < EPF_SIGMA_SKIP_THRESHOLD {
+        // J.4.3: the step's output is its input on this block.
+        for c in 0..3 {
+            let input_idx = y.saturating_mul(dims.width).saturating_add(x);
+            let v = ctx.input.get(c).and_then(|p| p.get(input_idx)).copied();
+            if let (Some(v), Some(slot)) = (v, out.get_mut(c).and_then(|p| p.get_mut(idx))) {
+                *slot = v;
             }
+        }
+        return;
+    }
 
-            let block_sigma = sigma.sigma_at(bx, by);
-            let (xi, yi) = (as_i64(x), as_i64(y));
-            let reference_at_border = at_block_border(xi, yi);
+    let block_sigma = sigma.sigma_at(bx, by);
+    let (xi, yi) = (as_i64(x), as_i64(y));
+    let reference_at_border = at_block_border(xi, yi);
 
-            let mut sum_weights = 0.0f32;
-            let mut sum_channels = [0.0f32; 3];
-            for (ix, iy) in kernel.iter().copied() {
-                let distance = ctx.distance(xi, yi, ix, iy, interior);
-                let at_border = if EPF_BORDER_SAD_AT_REFERENCE_PIXEL {
-                    reference_at_border
-                } else {
-                    at_block_border(xi + ix, yi + iy)
-                };
-                let weight = epf_weight(distance, block_sigma, ctx.step, at_border, ctx.params);
-                sum_weights += weight;
-                for (c, acc) in sum_channels.iter_mut().enumerate() {
-                    *acc = ctx
-                        .input_at(c, xi + ix, yi + iy, interior)
-                        .mul_add(weight, *acc);
-                }
-            }
+    let mut sum_weights = 0.0f32;
+    let mut sum_channels = [0.0f32; 3];
+    for (ix, iy) in kernel.iter().copied() {
+        let distance = ctx.distance(xi, yi, ix, iy, interior);
+        let at_border = if EPF_BORDER_SAD_AT_REFERENCE_PIXEL {
+            reference_at_border
+        } else {
+            at_block_border(xi + ix, yi + iy)
+        };
+        let weight = epf_weight(distance, block_sigma, ctx.step, at_border, ctx.params);
+        sum_weights += weight;
+        for (c, acc) in sum_channels.iter_mut().enumerate() {
+            *acc = ctx
+                .input_at(c, xi + ix, yi + iy, interior)
+                .mul_add(weight, *acc);
+        }
+    }
 
-            // sum_weights >= 1: the (0, 0) tap has zero distance and hence
-            // weight exactly 1, so this division is always safe.
-            for (c, acc) in sum_channels.iter().enumerate() {
-                if let Some(slot) = out.get_mut(c).and_then(|p| p.get_mut(idx)) {
-                    *slot = acc / sum_weights;
-                }
-            }
+    // sum_weights >= 1: the (0, 0) tap has zero distance and hence
+    // weight exactly 1, so this division is always safe.
+    for (c, acc) in sum_channels.iter().enumerate() {
+        if let Some(slot) = out.get_mut(c).and_then(|p| p.get_mut(idx)) {
+            *slot = acc / sum_weights;
         }
     }
 }
@@ -1135,6 +1356,102 @@ mod tests {
                         y.to_bits(),
                         "step {step:?} channel {c} sample {i}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the test indexes buffers it just sized to the frame; a panic \
+                  here is a failing test"
+    )]
+    fn lane_path_matches_scalar_reference_bitwise() {
+        // Proves the block-row lane path (`epf_step_rows_lanes`, in this
+        // host's baseline build and, where available, the dispatched
+        // AVX2+FMA build) writes exactly the scalar reference's bits on every
+        // step. The sigma field mixes skipped blocks (< 0.3), small sigmas
+        // that drive weights to the zero clamp, and large ones; the planes
+        // mix a full-range ramp with low-contrast noise; the frame is ragged
+        // (not a multiple of 8) and tall enough for several block rows, so
+        // lane blocks, edge pixels, partial last blocks, block-edge rows and
+        // the skip copy are all covered. A non-default border multiplier
+        // makes the per-lane border constant observable.
+        let dims = PlaneDims::new(83, 45);
+        let planes = [ramp(dims, 5), low_contrast(dims, 17), ramp(dims, 29)];
+        let (bx, by) = block_grid(dims);
+        let s: Vec<f32> = (0..bx * by)
+            .map(|i| match i % 5 {
+                0 => 0.1,
+                1 => 0.35,
+                2 => 0.02 * f32::from(u16::try_from(i % 97).unwrap_or(0)),
+                3 => 4.0,
+                _ => 40.0,
+            })
+            .collect();
+        let field = SigmaField::new(&s, bx, by).expect("valid");
+        let params = EpfParams {
+            border_sad_mul: 2.0 / 3.0,
+            ..EpfParams::default()
+        };
+        for step in [EpfStep::Step0, EpfStep::Step1, EpfStep::Step2] {
+            let refs = planes.each_ref().map(Vec::as_slice);
+            let ctx = StepCtx {
+                input: refs,
+                guide: refs,
+                dims,
+                params: &params,
+                step,
+            };
+            let run = |f: &dyn Fn([&mut [f32]; 3])| {
+                let mut out = [
+                    vec![0.0f32; dims.len()],
+                    vec![0.0f32; dims.len()],
+                    vec![0.0f32; dims.len()],
+                ];
+                f(out.each_mut().map(Vec::as_mut_slice));
+                out
+            };
+            let scalar =
+                run(&|o| epf_step_rows_impl(&ctx, &field, step.kernel(), 0..dims.height, o));
+            let lanes =
+                run(&|o| epf_step_rows_lanes(&ctx, &field, step.kernel(), 0..dims.height, o));
+            let dispatched =
+                run(&|o| epf_step_rows(&ctx, &field, step.kernel(), 0..dims.height, o));
+            // A band that starts mid-frame: `rel_y` differs from `y`.
+            let mut banded = [
+                vec![0.0f32; dims.len()],
+                vec![0.0f32; dims.len()],
+                vec![0.0f32; dims.len()],
+            ];
+            let start = 13 * dims.width;
+            epf_step_rows_lanes(
+                &ctx,
+                &field,
+                step.kernel(),
+                13..dims.height,
+                banded.each_mut().map(|p| &mut p[start..]),
+            );
+            for c in 0..3 {
+                for (i, want) in scalar[c].iter().enumerate() {
+                    assert_eq!(
+                        lanes[c][i].to_bits(),
+                        want.to_bits(),
+                        "lanes {step:?} c{c} i{i}"
+                    );
+                    assert_eq!(
+                        dispatched[c][i].to_bits(),
+                        want.to_bits(),
+                        "dispatched {step:?} c{c} i{i}"
+                    );
+                    if i >= start {
+                        assert_eq!(
+                            banded[c][i].to_bits(),
+                            want.to_bits(),
+                            "band {step:?} c{c} i{i}"
+                        );
+                    }
                 }
             }
         }

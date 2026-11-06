@@ -2953,8 +2953,9 @@ fn decode_vardct_frame(
     )?;
 
     // ---- I.5.3, I.6, I.8, I.9 -------------------------------------------
+    let matrix_cache = render::DequantMatrixCache::new(&hf_params.matrices);
     let dequant = render::HfDequantParams {
-        matrices: &hf_params.matrices,
+        matrices: &matrix_cache,
         quant_bias: opsin(metadata).quant_bias,
         quant_bias_numerator: opsin(metadata).quant_bias_numerator,
         global_scale: vardct.quantizer.global_scale,
