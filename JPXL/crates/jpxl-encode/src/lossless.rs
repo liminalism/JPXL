@@ -506,6 +506,7 @@ pub fn plan_for(
         rct,
         budget,
         group_size_shift,
+        options.resources.workers_for(usize::MAX),
         #[cfg(test)]
         FullSearchProbe::Normal,
     )
@@ -532,6 +533,13 @@ enum FullSearchProbe {
 /// # Errors
 ///
 /// Any error from residual collection, ANS table build, or [`validate`].
+#[cfg_attr(
+    test,
+    allow(
+        clippy::too_many_arguments,
+        reason = "the test-only probe is the eighth; release builds take seven"
+    )
+)]
 fn plan_by_full_search(
     width: u32,
     height: u32,
@@ -539,6 +547,7 @@ fn plan_by_full_search(
     rct: bool,
     budget: ModularSearchBudget,
     group_size_shift: u32,
+    workers: usize,
     #[cfg(test)] probe: FullSearchProbe,
 ) -> Result<ValidatedLosslessPlan> {
     #[cfg(test)]
@@ -602,6 +611,7 @@ fn plan_by_full_search(
             group_size_shift,
             PriceTier::Cheap {
                 row_stride: cheap_row_stride,
+                workers,
             },
         )?;
         if best.as_ref().is_none_or(|(c, _)| cost < *c) {
@@ -643,6 +653,7 @@ fn plan_by_full_search(
                         group_size_shift,
                         PriceTier::Cheap {
                             row_stride: cheap_row_stride,
+                            workers,
                         },
                     )?;
                     if cost < best_cost && round_best.as_ref().is_none_or(|(c, _)| cost < *c) {
@@ -686,6 +697,7 @@ fn plan_by_full_search(
                     group_size_shift,
                     PriceTier::Cheap {
                         row_stride: cheap_row_stride,
+                        workers,
                     },
                 )?;
                 if cost < best_cost {
@@ -715,7 +727,7 @@ fn plan_by_full_search(
             best_tree.clone(),
             true,
         );
-        best_cost = total_cost_source(&ma_source, group_size_shift, PriceTier::Exact)?;
+        best_cost = total_cost_source(&ma_source, group_size_shift, PriceTier::Exact { workers })?;
     }
 
     // Nested palette trial on *source* samples (not RCT). Exact-price gate.
@@ -731,7 +743,7 @@ fn plan_by_full_search(
         let cost = total_cost_source(
             &modular::ModularSource::from_palette(fwd.clone(), tree.clone(), true),
             group_size_shift,
-            PriceTier::Exact,
+            PriceTier::Exact { workers },
         )?;
         if cost < best_cost {
             best_cost = cost;
@@ -767,7 +779,7 @@ fn plan_by_full_search(
         } else {
             source
         };
-        let cost = total_cost_source(&source, group_size_shift, PriceTier::Exact)?;
+        let cost = total_cost_source(&source, group_size_shift, PriceTier::Exact { workers })?;
         if cost < best_cost {
             best_cost = cost;
             best_tree = tree;
@@ -791,10 +803,16 @@ fn plan_by_full_search(
 enum PriceTier {
     /// Collect residuals + Shannon hybrid estimate (no ANS emit). `row_stride`
     /// is the sampled-gather stride the effort budget chose (`1` = every row).
-    Cheap { row_stride: u32 },
+    Cheap { row_stride: u32, workers: usize },
     /// Full residual ANS write path (count-only BitWriter).
-    Exact,
+    Exact { workers: usize },
 }
+
+// Both tiers carry the request's worker budget. The prices they compute are
+// integer sums over independent channels or sections, reduced in order, so
+// the worker count cannot change a price, a planning decision or a byte
+// (Contract A); it only decides how much of the planner's scanning runs on
+// the encode's threads.
 
 /// Multiplicity counters for one [`plan_for`] call (Opt-M + Phase-0 diagnostics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -996,21 +1014,24 @@ fn residual_stream_cost_source(
     tier: PriceTier,
 ) -> Result<u64> {
     match tier {
-        PriceTier::Cheap { row_stride } => {
+        PriceTier::Cheap {
+            row_stride,
+            workers,
+        } => {
             bump_cheap();
             #[cfg(feature = "phase4b-sampled-gather")]
             {
-                sampled_cheap_residual_bits(source, row_stride)
+                modular::estimate_residual_bits_sampled_with(source, row_stride, workers)
             }
             #[cfg(not(feature = "phase4b-sampled-gather"))]
             {
                 let _ = row_stride;
-                cheap_residual_bits(source, group_size_shift)
+                cheap_residual_bits(source, group_size_shift, workers)
             }
         }
-        PriceTier::Exact => {
+        PriceTier::Exact { workers } => {
             bump_exact();
-            exact_residual_bits(source, group_size_shift)
+            exact_residual_bits(source, group_size_shift, workers)
         }
     }
 }
@@ -1023,13 +1044,14 @@ fn residual_stream_cost_source(
 const SAMPLED_GATHER_ROW_STRIDE: u32 = 4;
 
 /// Phase 4B additive scorer: rows a strided subset instead of a full plane
-/// scan. Always compiled (regardless of the feature) so decision-preservation
-/// tests can compare it against [`cheap_residual_bits`] directly; only
-/// [`residual_stream_cost_source`]'s dispatch is feature-gated, so a default
-/// build's search path never calls this function.
+/// scan, serially. Test-only, so decision-preservation tests can compare it
+/// against [`cheap_residual_bits`] directly; the search path calls
+/// [`modular::estimate_residual_bits_sampled_with`] through
+/// [`residual_stream_cost_source`]'s feature-gated dispatch, which differs
+/// only in running a Weighted fallback on the planner's workers.
 ///
 /// See jpegxl-rs.work.arch-phase4b-sampled-gather-scoped.
-#[cfg(any(feature = "phase4b-sampled-gather", test))]
+#[cfg(test)]
 fn sampled_cheap_residual_bits(source: &modular::ModularSource, row_stride: u32) -> Result<u64> {
     modular::estimate_residual_bits_sampled(source, row_stride)
 }
@@ -1041,75 +1063,87 @@ fn sampled_cheap_residual_bits(source: &modular::ModularSource, row_stride: u32)
 /// preservation tests can compare it against
 /// [`sampled_cheap_residual_bits`] directly.
 #[cfg(any(not(feature = "phase4b-sampled-gather"), test))]
-fn cheap_residual_bits(source: &modular::ModularSource, group_size_shift: u32) -> Result<u64> {
+fn cheap_residual_bits(
+    source: &modular::ModularSource,
+    group_size_shift: u32,
+    workers: usize,
+) -> Result<u64> {
     let geometry = crate::frame::Geometry::new(source.width, source.height, group_size_shift)?;
     if geometry.is_single_section() {
-        return modular::estimate_residual_bits_full(source);
+        return modular::estimate_residual_bits_full_with(source, workers);
     }
     // Multi-section: estimate full-frame residuals once (ranking quality), not
     // per-group exact streams. Finalist Exact re-prices with the real layout.
-    modular::estimate_residual_bits_full(source)
+    modular::estimate_residual_bits_full_with(source, workers)
 }
 
 /// Stage-C exact residual ANS cost (count-only writer; no payload retain).
-fn exact_residual_bits(source: &modular::ModularSource, group_size_shift: u32) -> Result<u64> {
+///
+/// Each section's payload is written independently, so the sections are
+/// priced on up to `workers` threads and summed in section order; the total
+/// is an integer sum (saturating sums of non-negative terms equal
+/// `min(sum, MAX)` in any order) and the first error in section order is
+/// the one returned, so the price is the serial price.
+fn exact_residual_bits(
+    source: &modular::ModularSource,
+    group_size_shift: u32,
+    workers: usize,
+) -> Result<u64> {
     use jpxl_bitstream::BitWriter;
 
     let geometry = crate::frame::Geometry::new(source.width, source.height, group_size_shift)?;
-    let mut bits = 0u64;
     if geometry.is_single_section() {
         let mut w = BitWriter::counting();
         modular::write_residual_payload_full(&mut w, source)?;
-        bits = bits.saturating_add(w.bit_len());
-    } else {
-        let part = modular::partition_channels(source, geometry.group_dim());
-        if !part.lf_global.is_empty() {
-            let mut w = BitWriter::counting();
-            modular::write_residual_payload_indices(&mut w, source, &part.lf_global, None)?;
-            bits = bits.saturating_add(w.bit_len());
-        }
-        for index in 0..geometry.num_lf_groups() {
-            let (x0, y0, gw, gh) = geometry.lf_group_rect(index).ok_or_else(|| {
-                EncodeError::unsupported("an LF group index past the grid", "G.2")
-            })?;
-            if part.lf_group.is_empty() {
-                continue;
-            }
-            let mut w = BitWriter::counting();
-            modular::write_residual_payload_indices(
-                &mut w,
-                source,
+        return Ok(w.bit_len());
+    }
+    let part = modular::partition_channels(source, geometry.group_dim());
+    let price = |indices: &[usize], rect: Option<Rect>| -> Result<u64> {
+        let mut w = BitWriter::counting();
+        modular::write_residual_payload_indices(&mut w, source, indices, rect)?;
+        Ok(w.bit_len())
+    };
+    let mut bits = 0u64;
+    if !part.lf_global.is_empty() {
+        bits = bits.saturating_add(price(&part.lf_global, None)?);
+    }
+    if !part.lf_group.is_empty() {
+        let n = usize::try_from(geometry.num_lf_groups()).unwrap_or(0);
+        let sections = crate::resources::ordered_map(n, workers, |index| {
+            let (x0, y0, width, height) = geometry
+                .lf_group_rect(u64::try_from(index).unwrap_or(u64::MAX))
+                .ok_or_else(|| {
+                    EncodeError::unsupported("an LF group index past the grid", "G.2")
+                })?;
+            price(
                 &part.lf_group,
                 Some(Rect {
                     x0,
                     y0,
-                    width: gw,
-                    height: gh,
+                    width,
+                    height,
                 }),
-            )?;
-            bits = bits.saturating_add(w.bit_len());
-        }
-        for index in 0..geometry.num_groups() {
-            let (x0, y0, gw, gh) = geometry
-                .group_rect(index)
+            )
+        })?;
+        bits = sections.into_iter().fold(bits, u64::saturating_add);
+    }
+    if !part.pass_group.is_empty() {
+        let n = usize::try_from(geometry.num_groups()).unwrap_or(0);
+        let sections = crate::resources::ordered_map(n, workers, |index| {
+            let (x0, y0, width, height) = geometry
+                .group_rect(u64::try_from(index).unwrap_or(u64::MAX))
                 .ok_or_else(|| EncodeError::unsupported("a group index past the grid", "G.4"))?;
-            if part.pass_group.is_empty() {
-                continue;
-            }
-            let mut w = BitWriter::counting();
-            modular::write_residual_payload_indices(
-                &mut w,
-                source,
+            price(
                 &part.pass_group,
                 Some(Rect {
                     x0,
                     y0,
-                    width: gw,
-                    height: gh,
+                    width,
+                    height,
                 }),
-            )?;
-            bits = bits.saturating_add(w.bit_len());
-        }
+            )
+        })?;
+        bits = sections.into_iter().fold(bits, u64::saturating_add);
     }
     Ok(bits)
 }
@@ -1180,7 +1214,7 @@ mod tests {
                     false,
                 );
                 let full_cost =
-                    cheap_residual_bits(&source, DEFAULT_GROUP_SIZE_SHIFT).expect("full cost");
+                    cheap_residual_bits(&source, DEFAULT_GROUP_SIZE_SHIFT, 1).expect("full cost");
                 let sampled_cost = sampled_cheap_residual_bits(&source, SAMPLED_GATHER_ROW_STRIDE)
                     .expect("sampled cost");
                 if baseline_best.as_ref().is_none_or(|(c, _)| full_cost < *c) {
@@ -1203,8 +1237,12 @@ mod tests {
                     tree,
                     false,
                 );
-                total_cost_source(&source, DEFAULT_GROUP_SIZE_SHIFT, PriceTier::Exact)
-                    .expect("exact price")
+                total_cost_source(
+                    &source,
+                    DEFAULT_GROUP_SIZE_SHIFT,
+                    PriceTier::Exact { workers: 1 },
+                )
+                .expect("exact price")
             };
 
             let baseline_exact = exact_price_of(baseline_predictor);
@@ -1303,6 +1341,7 @@ mod tests {
                         rct,
                         budget,
                         group_size_shift,
+                        1,
                         FullSearchProbe::ForegoneBudget,
                     )
                     .expect("full-search plan");
@@ -1703,7 +1742,7 @@ mod tests {
     /// Phase 4A's decision-preservation guarantee is structural, not a
     /// tolerance check like Phase 4B's: Weighted is a strictly ADDED
     /// candidate scored by the same exact final-price gate every other
-    /// predictor goes through (`total_cost_source(..., PriceTier::Exact)`,
+    /// predictor goes through (`total_cost_source(..., PriceTier::Exact { workers: 1 })`,
     /// unconditional regardless of which tier's search proposed the
     /// finalist), so adding it can only ever match or beat what the
     /// pre-4A six-predictor search would have chosen -- never lose. This
@@ -1750,7 +1789,7 @@ mod tests {
                 std::slice::from_ref(&shared),
                 &tree,
                 DEFAULT_GROUP_SIZE_SHIFT,
-                PriceTier::Exact,
+                PriceTier::Exact { workers: 1 },
             )
             .expect("exact cost");
             if best.as_ref().is_none_or(|(c, _)| cost < *c) {

@@ -1693,8 +1693,43 @@ pub fn estimate_residual_bits_indices(
 ///
 /// As [`estimate_residual_bits_indices`].
 pub fn estimate_residual_bits_full(source: &ModularSource) -> Result<u64> {
-    let indices: Vec<usize> = (0..source.channels.len()).collect();
-    estimate_residual_bits_indices(source, &indices, None)
+    estimate_residual_bits_full_with(source, 1)
+}
+
+/// [`estimate_residual_bits_full`] with the channels collected on up to
+/// `workers` threads.
+///
+/// The planner's full-frame estimate is otherwise a single-threaded scan,
+/// and for a tree with a [`Predictor::Weighted`] leaf it cannot be sampled
+/// (H.5.1's state needs every sample in order), so it dominated planning
+/// wall time at every effort that can choose Weighted. Each channel's events
+/// are a function of that channel's samples and the tree alone, so
+/// collecting them separately and concatenating in channel order yields
+/// exactly the serial event list, and so the same estimate (Contract A).
+///
+/// # Errors
+///
+/// As [`estimate_residual_bits_indices`]; the first error in channel order.
+pub(crate) fn estimate_residual_bits_full_with(
+    source: &ModularSource,
+    workers: usize,
+) -> Result<u64> {
+    let n = source.channels.len();
+    let events = if workers <= 1 || n <= 1 {
+        let indices: Vec<usize> = (0..n).collect();
+        collect_residuals_indices(source, &indices, None)?
+    } else {
+        let parts = crate::resources::ordered_map(n, workers, |i| {
+            collect_residuals_indices(source, &[i], None)
+        })?;
+        let mut events = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for part in parts {
+            events.extend(part);
+        }
+        events
+    };
+    let scanned = u64::try_from(events.len()).unwrap_or(u64::MAX);
+    hybrid_estimate_from_events(&events, source.tree.num_contexts(), scanned, scanned)
 }
 
 /// Phase 4B: sampled variant of [`estimate_residual_bits_full`].
@@ -1720,8 +1755,23 @@ pub fn estimate_residual_bits_full(source: &ModularSource) -> Result<u64> {
 ///
 /// Residual out of range or census/hybrid-config rejection.
 pub fn estimate_residual_bits_sampled(source: &ModularSource, row_stride: u32) -> Result<u64> {
+    estimate_residual_bits_sampled_with(source, row_stride, 1)
+}
+
+/// [`estimate_residual_bits_sampled`] whose Weighted fallback runs on up to
+/// `workers` threads (see [`estimate_residual_bits_full_with`]); the sampled
+/// scan itself is unchanged.
+///
+/// # Errors
+///
+/// As [`estimate_residual_bits_sampled`].
+pub(crate) fn estimate_residual_bits_sampled_with(
+    source: &ModularSource,
+    row_stride: u32,
+    workers: usize,
+) -> Result<u64> {
     if source.tree.contains_predictor(Predictor::Weighted) {
-        return estimate_residual_bits_full(source);
+        return estimate_residual_bits_full_with(source, workers);
     }
     let indices: Vec<usize> = (0..source.channels.len()).collect();
     let events = collect_residuals_indices_sampled(source, &indices, row_stride)?;
