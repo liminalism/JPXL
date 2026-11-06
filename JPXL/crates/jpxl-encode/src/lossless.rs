@@ -224,6 +224,16 @@ struct ModularSearchBudget {
     /// [`u64::MAX`] means "unbounded" — the floor stride wins and behaviour is
     /// exactly the pre-budget fixed-stride search.
     cheap_sample_budget: u64,
+    /// Whether to exact-price a single-leaf [`Predictor::Weighted`] tree
+    /// against the searched finalist (see [`weighted_challenger`]).
+    ///
+    /// For the levels whose sweep is stateless (2-6). Their cheap tier cannot
+    /// rank Weighted fairly: its estimate must be a full sequential scan
+    /// while the stateless candidates are row-sampled, and on a smooth 16-bit
+    /// ramp that mismatch picked a Weighted root 43% larger than Gradient.
+    /// Exact-pricing the one challenger instead can only keep a plan whose
+    /// exact price is lower.
+    weighted_challenger: bool,
 }
 
 /// The row stride the cheap tier actually uses: [`ModularSearchBudget::cheap_row_stride`]
@@ -332,6 +342,8 @@ impl ModularSearchBudget {
             // for. Level 7 must stay `MAX` permanently — it is the
             // byte-identical density anchor.
             cheap_sample_budget: u64::MAX,
+            // Level 7 sweeps Weighted itself.
+            weighted_challenger: false,
         };
         match effort.level() {
             1 => Self {
@@ -347,6 +359,7 @@ impl ModularSearchBudget {
                 ..default
             },
             2 => Self {
+                weighted_challenger: true,
                 predictors: PREDS_E2,
                 split_properties: PROPS_E2,
                 split_thresholds: THRESH_E2,
@@ -359,6 +372,7 @@ impl ModularSearchBudget {
                 ..default
             },
             3 => Self {
+                weighted_challenger: true,
                 predictors: PREDS_E3,
                 split_properties: PROPS_E3,
                 split_thresholds: THRESH_E3,
@@ -369,6 +383,7 @@ impl ModularSearchBudget {
                 ..default
             },
             4 => Self {
+                weighted_challenger: true,
                 predictors: PREDS_STATELESS,
                 split_properties: PROPS_E4,
                 split_thresholds: THRESH_E4,
@@ -377,12 +392,14 @@ impl ModularSearchBudget {
                 ..default
             },
             5 => Self {
+                weighted_challenger: true,
                 predictors: PREDS_STATELESS,
                 split_properties: PROPS_E5,
                 split_thresholds: THRESH_E5,
                 ..default
             },
             6 => Self {
+                weighted_challenger: true,
                 predictors: PREDS_STATELESS,
                 ..default
             },
@@ -446,6 +463,7 @@ impl ModularSearchBudget {
             && !self.refine_leaves
             && !self.try_palette
             && !self.try_squeeze
+            && !self.weighted_challenger
     }
 }
 
@@ -718,7 +736,7 @@ fn plan_by_full_search(
     // residual LZ77 gate as final emission (`encode_codestream_with_plan`).
     // Cheap-tier trials stay LZ77-free via `total_cost_shared` (Shannon residual
     // estimate only).
-    if budget.try_palette || budget.try_squeeze {
+    if budget.try_palette || budget.try_squeeze || budget.weighted_challenger {
         let ma_source = modular::ModularSource::direct_shared(
             width,
             height,
@@ -728,6 +746,20 @@ fn plan_by_full_search(
             true,
         );
         best_cost = total_cost_source(&ma_source, group_size_shift, PriceTier::Exact { workers })?;
+    }
+    if budget.weighted_challenger
+        && let Some((cost, tree)) = weighted_challenger(
+            width,
+            height,
+            &shared_score,
+            &best_tree,
+            best_cost,
+            group_size_shift,
+            workers,
+        )?
+    {
+        best_cost = cost;
+        best_tree = tree;
     }
 
     // Nested palette trial on *source* samples (not RCT). Exact-price gate.
@@ -796,6 +828,40 @@ fn plan_by_full_search(
         squeeze: use_squeeze && no_palette,
         tree: best_tree,
     })
+}
+
+/// The exact-priced Weighted challenger of efforts 2-6.
+///
+/// Prices a single-leaf [`Predictor::Weighted`] tree on the MA score planes
+/// with the same Stage-C exact tier as the finalist (`finalist_cost`), and
+/// returns it only when it is strictly cheaper. Efforts 7+ already found
+/// that a photograph's winning tree is usually exactly this one — a split
+/// buys nothing on top of it — so one exact price recovers most of their
+/// density at a fraction of their search. Returns `None` when the finalist
+/// already uses Weighted.
+fn weighted_challenger(
+    width: u32,
+    height: u32,
+    shared_score: &[modular::SharedPlane],
+    finalist: &MaTree,
+    finalist_cost: u64,
+    group_size_shift: u32,
+    workers: usize,
+) -> Result<Option<(u64, MaTree)>> {
+    if finalist.contains_predictor(Predictor::Weighted) {
+        return Ok(None);
+    }
+    let tree = MaTree::single_leaf(Predictor::Weighted);
+    let source = modular::ModularSource::direct_shared(
+        width,
+        height,
+        shared_score,
+        false,
+        tree.clone(),
+        true,
+    );
+    let cost = total_cost_source(&source, group_size_shift, PriceTier::Exact { workers })?;
+    Ok((cost < finalist_cost).then_some((cost, tree)))
 }
 
 /// How residual candidates are priced (Opt-M tiered planner).
@@ -2014,6 +2080,107 @@ mod tests {
     /// deep-search path, and honour its own leaf cap. 48×48 is below every
     /// level's `deep_search_sample_cap`, so this exercises efforts 1-9 through
     /// the multi-split search cheaply.
+    /// Pins the Weighted challenger's contract on efforts 2-6: it is taken
+    /// exactly when its Stage-C exact price beats the searched finalist's, so
+    /// the plan an effort emits is never priced above the one it would have
+    /// emitted without the challenger; efforts 1 and 7+ never run it. On a
+    /// noisy textured plane (where the self-correcting predictor wins) the
+    /// plan switches to it; on a smooth ramp (where the cheap tier's
+    /// full-vs-sampled mismatch once picked a 43%-larger Weighted root) it
+    /// does not.
+    #[test]
+    fn the_weighted_challenger_is_taken_only_when_exactly_cheaper() {
+        let (w, h) = (96u32, 80u32);
+        let mut state = 0x2545_f491_u32;
+        let textured: Plane = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let wave = ((x as f32 * 0.31).sin() * 40.0 + (y as f32 * 0.17).cos() * 30.0) as i32;
+                (128 + wave + (state % 9) as i32 - 4).clamp(0, 255)
+            })
+            .collect();
+        let ramp: Plane = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x * 600 + y * 300) as i32))
+            .collect();
+        let exact = |plane: &Plane, tree: &MaTree| -> u64 {
+            let shared = vec![std::sync::Arc::<[i32]>::from(plane.as_slice())];
+            let source =
+                modular::ModularSource::direct_shared(w, h, &shared, false, tree.clone(), true);
+            total_cost_source(
+                &source,
+                DEFAULT_GROUP_SIZE_SHIFT,
+                PriceTier::Exact { workers: 1 },
+            )
+            .expect("exact price")
+        };
+        let weighted = MaTree::single_leaf(Predictor::Weighted);
+        let mut checked = [0usize; 2];
+        for level in 1..=9u8 {
+            let effort = Effort::new(level).expect("valid");
+            let budget = ModularSearchBudget::for_effort(effort);
+            assert_eq!(
+                budget.weighted_challenger,
+                (2..=6).contains(&level),
+                "level {level}"
+            );
+            if !budget.weighted_challenger {
+                continue;
+            }
+            let options = EncodeOptions {
+                effort,
+                ..EncodeOptions::default()
+            };
+            let without = ModularSearchBudget {
+                weighted_challenger: false,
+                ..budget
+            };
+            for (name, plane) in [("textured", &textured), ("ramp", &ramp)] {
+                let with =
+                    plan_for(w, h, std::slice::from_ref(plane), false, &options).expect("plan");
+                let base = plan_by_full_search(
+                    w,
+                    h,
+                    std::slice::from_ref(plane),
+                    false,
+                    without,
+                    DEFAULT_GROUP_SIZE_SHIFT,
+                    1,
+                    FullSearchProbe::Normal,
+                )
+                .expect("plan");
+                let (with, base) = (with.plan(), base.plan());
+                if with.palette.is_some() || base.palette.is_some() || with.squeeze || base.squeeze
+                {
+                    continue;
+                }
+                let took = with.tree == weighted && base.tree != weighted;
+                assert_eq!(
+                    took,
+                    exact(plane, &weighted) < exact(plane, &base.tree),
+                    "level {level} {name}"
+                );
+                assert!(
+                    exact(plane, &with.tree) <= exact(plane, &base.tree),
+                    "level {level} {name}"
+                );
+                if name == "textured" {
+                    assert!(took, "level {level}: Weighted should win on texture");
+                    checked[0] += 1;
+                } else {
+                    assert!(!took, "level {level}: Weighted must not win on the ramp");
+                    checked[1] += 1;
+                }
+            }
+        }
+        assert!(
+            checked.iter().all(|&n| n > 0),
+            "both planes exercised: {checked:?}"
+        );
+    }
+
     #[test]
     fn every_effort_plans_a_valid_tree_on_the_deep_path() {
         let (w, h) = (48u32, 48u32);
