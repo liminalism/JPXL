@@ -595,7 +595,7 @@ pub fn epf_step_rows(
         #[allow(unsafe_code)]
         return unsafe { epf_step_rows_fma(step, input, params, sigma, rows, out) };
     }
-    epf_step_rows_impl(step, input, params, sigma, rows, out)
+    epf_step_rows_impl::<false>(step, input, params, sigma, rows, out)
 }
 
 /// [`epf_step_rows`] compiled with hardware fused multiply-add.
@@ -612,11 +612,16 @@ fn epf_step_rows_fma(
     rows: core::ops::Range<usize>,
     out: &mut [&mut [f32]; 3],
 ) -> Option<()> {
-    epf_step_rows_impl(step, input, params, sigma, rows, out)
+    epf_step_rows_impl::<true>(step, input, params, sigma, rows, out)
 }
 
+/// The J.4 row filter. With `LANES = false` every pixel runs the per-pixel
+/// weight loop: the readable reference, which non-FMA hosts dispatch to and
+/// which `lane_path_matches_the_per_pixel_reference_bitwise` holds the lane
+/// path to. With `LANES = true` full 8-wide blocks go through
+/// [`weigh_block_lanes`] instead (bit-identical by construction).
 #[inline(always)]
-fn epf_step_rows_impl(
+fn epf_step_rows_impl<const LANES: bool>(
     step: EpfStep,
     input: &[PaddedPlane; 3],
     params: &EpfParams,
@@ -704,6 +709,21 @@ fn epf_step_rows_impl(
             // Guarded by the skip test above, so `block_sigma` is at least
             // EPF_SIGMA_SKIP_THRESHOLD and this cannot divide by zero.
             let inv_sigma = epf_inv_sigma(block_sigma, step, params);
+            if LANES
+                && x_end - x0 == EPF_BLOCK_DIM
+                && weigh_block_lanes(
+                    &dist,
+                    &tap_rows,
+                    x0,
+                    row_index * width + x0,
+                    inv_sigma,
+                    border_row,
+                    params,
+                    out,
+                )
+            {
+                continue;
+            }
             for x in x0..x_end {
                 let idx = row_index * width + x;
                 let rx = as_i64(x).rem_euclid(BLOCK_DIM_I);
@@ -728,6 +748,75 @@ fn epf_step_rows_impl(
         }
     }
     Some(())
+}
+
+/// The J.4.3/J.4.4 weight-and-average loop of [`epf_step_rows_impl`] for one
+/// full 8-wide block row, eight pixels at a time.
+///
+/// **Bit-identical to the per-pixel loop by construction.** Each lane is one
+/// pixel and performs that loop's IEEE operations in its order: taps in
+/// kernel order, the same [`epf_weight_with_inv_sigma`] call, the same
+/// `sum_weights` addition, the same channel `mul_add`s and the same final
+/// division. Only the interleaving across pixels changes, and no value flows
+/// between pixels. The border flag is the per-pixel one with `x % 8 == lane`
+/// (`x0` is a multiple of 8). The fixed-width loops vectorize in the
+/// AVX2+FMA build.
+///
+/// Returns `false` without writing if a row slice is short, in which case
+/// the caller runs the per-pixel loop instead.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "every index is a `0..EPF_BLOCK_DIM` loop counter into a \
+              `[f32; EPF_BLOCK_DIM]` array, a compile-time bound; slices are \
+              taken with checked `get`"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the per-row state of epf_step_rows_impl, passed through unchanged"
+)]
+#[inline(always)]
+fn weigh_block_lanes(
+    dist: &[Vec<f32>],
+    tap_rows: &[[&[f32]; 3]],
+    x0: usize,
+    out_at: usize,
+    inv_sigma: f32,
+    border_row: bool,
+    params: &EpfParams,
+    out: &mut [&mut [f32]; 3],
+) -> bool {
+    const L: usize = EPF_BLOCK_DIM;
+    let lanes = |row: &[f32]| -> Option<[f32; L]> { row.get(x0..x0 + L)?.try_into().ok() };
+    let mut sum_weights = [0.0f32; L];
+    let mut acc = [[0.0f32; L]; 3];
+    for (d, rows3) in dist.iter().zip(tap_rows) {
+        let Some(distance) = lanes(d) else {
+            return false;
+        };
+        let mut weight = [0.0f32; L];
+        for l in 0..L {
+            let at_border = border_row || l == 0 || l == L - 1;
+            weight[l] = epf_weight_with_inv_sigma(distance[l], inv_sigma, at_border, params);
+            sum_weights[l] += weight[l];
+        }
+        for (c, slot) in acc.iter_mut().enumerate() {
+            let Some(v) = rows3.get(c).and_then(|r| lanes(r)) else {
+                return false;
+            };
+            for l in 0..L {
+                slot[l] = v[l].mul_add(weight[l], slot[l]);
+            }
+        }
+    }
+    for (c, plane) in out.iter_mut().enumerate() {
+        let Some(dst) = plane.get_mut(out_at..out_at + L) else {
+            return false;
+        };
+        for (l, slot) in dst.iter_mut().enumerate() {
+            *slot = acc[c][l] / sum_weights[l];
+        }
+    }
+    true
 }
 
 /// Runs one J.4 step over the three colour planes, returning fresh planes.
@@ -841,6 +930,80 @@ mod tests {
         )
         .expect("shapes agree");
         assert_eq!(filtered[1], plane);
+    }
+
+    #[test]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the test indexes buffers it just sized; a panic is a failing test"
+    )]
+    fn lane_path_matches_the_per_pixel_reference_bitwise() {
+        // Proves the 8-wide block path (baseline build and, on an AVX2+FMA
+        // host, the dispatched build) writes the per-pixel reference's bits
+        // on every step, over a ragged frame (partial last block), a sigma
+        // field mixing skipped, clamping and wide blocks, full-range and
+        // low-contrast planes, a non-default border multiplier, and a band
+        // that starts mid-frame.
+        let dims = PlaneDims::new(83, 45);
+        let plane = |seed: u32, span: u32| -> Vec<f32> {
+            (0..dims.len())
+                .map(|i| {
+                    let v = u32::try_from(i).unwrap_or(0).wrapping_mul(2_654_435_761) ^ seed;
+                    f32::from(u16::try_from(v % span).unwrap_or(0)) / 1000.0
+                })
+                .collect()
+        };
+        let planes = [plane(5, 1000), plane(17, 8), plane(29, 1000)];
+        let (bx, by) = block_grid(dims);
+        let s: Vec<f32> = (0..bx * by)
+            .map(|i| match i % 5 {
+                0 => 0.1,
+                1 => 0.35,
+                2 => 0.02 * f32::from(u16::try_from(i % 97).unwrap_or(0)),
+                3 => 4.0,
+                _ => 40.0,
+            })
+            .collect();
+        let field = SigmaField::new(&s, bx, by).expect("valid");
+        let params = EpfParams {
+            border_sad_mul: 2.0 / 3.0,
+            ..EpfParams::default()
+        };
+        let padded = planes
+            .each_ref()
+            .map(|p| PaddedPlane::new(p, dims, EPF_PAD).expect("valid"));
+        for step in [EpfStep::Step0, EpfStep::Step1, EpfStep::Step2] {
+            for rows in [0..dims.height, 13..dims.height] {
+                let len = dims.width * rows.len();
+                let run = |f: &dyn Fn(&mut [&mut [f32]; 3]) -> Option<()>| {
+                    let mut out = [vec![0.0f32; len], vec![0.0f32; len], vec![0.0f32; len]];
+                    {
+                        let [a, b, c] = &mut out;
+                        f(&mut [a.as_mut_slice(), b.as_mut_slice(), c.as_mut_slice()])
+                            .expect("filtered");
+                    }
+                    out
+                };
+                let reference = run(&|o| {
+                    epf_step_rows_impl::<false>(step, &padded, &params, &field, rows.clone(), o)
+                });
+                let lanes = run(&|o| {
+                    epf_step_rows_impl::<true>(step, &padded, &params, &field, rows.clone(), o)
+                });
+                let dispatched =
+                    run(&|o| epf_step_rows(step, &padded, &params, &field, rows.clone(), o));
+                for c in 0..3 {
+                    for (i, want) in reference[c].iter().enumerate() {
+                        assert_eq!(lanes[c][i].to_bits(), want.to_bits(), "{step:?} c{c} i{i}");
+                        assert_eq!(
+                            dispatched[c][i].to_bits(),
+                            want.to_bits(),
+                            "dispatched {step:?} c{c} i{i}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
