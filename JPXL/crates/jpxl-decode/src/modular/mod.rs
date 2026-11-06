@@ -116,8 +116,8 @@ pub use palette::{DELTA_PALETTE, PaletteContext, PaletteParams};
 pub use predictor::{Neighbours, Predictor};
 pub use squeeze::SqueezeParams;
 pub use transform::{ChannelLayout, Transform};
-pub use tree::{Leaf, MaTree, PropertyBuilder, TreeLimits, TreeNode};
-pub use weighted::{WeightedState, WpHeader};
+pub use tree::{Leaf, MaTree, PropertyBuilder, TreeLimits, TreeNode, TreeUsage};
+pub use weighted::{WeightedPrediction, WeightedState, WpHeader};
 
 use error::malformed;
 
@@ -671,6 +671,10 @@ pub fn decode_channels(
         .unwrap_or(0);
     decoder.set_dist_multiplier(dist_multiplier);
 
+    // What this tree can observe; everything else is skipped below. See
+    // `MaTree::usage` for why the samples are unchanged.
+    let usage = tree.usage();
+
     for i in 0..limit {
         let spec = channels
             .get(i)
@@ -680,7 +684,10 @@ pub fn decode_channels(
         if spec.is_empty() {
             continue;
         }
-        let mut properties = PropertyBuilder::new(channels, i, options.stream_index, guard)?;
+        let mut properties =
+            PropertyBuilder::new(channels, i, options.stream_index, guard)?.observing(usage);
+        // Allocated (and charged) whether or not it runs, so the guard sees
+        // the same charges as the full H.3 computation.
         let mut wp = WeightedState::new(spec.width, guard)?;
 
         let (earlier, from_here) = channels.split_at_mut(i);
@@ -691,8 +698,14 @@ pub fn decode_channels(
         for y in 0..spec.height {
             for x in 0..spec.width {
                 let nb = Neighbours::gather(current, x, y);
-                // H.5.1: invoked for every sample, whatever the leaf predictor.
-                let weighted = wp.predict(&header.wp_header, &nb.into(), x);
+                // H.5.1: invoked for every sample, whatever the leaf predictor
+                // — unless no leaf predicts from it and no decision tests its
+                // max_error, in which case neither output is observable.
+                let weighted = if usage.weighted {
+                    wp.predict(&header.wp_header, &nb.into(), x)
+                } else {
+                    WeightedPrediction::default()
+                };
                 let props = properties.compute(earlier, current, x, y, &nb, weighted.max_error);
                 let leaf = tree.traverse(props)?;
 
@@ -707,9 +720,13 @@ pub fn decode_channels(
                     diff.wrapping_add(nb.predict(leaf.predictor, weighted.prediction)),
                 );
                 current.set(x, y, value);
-                wp.update(x, &weighted, value);
+                if usage.weighted {
+                    wp.update(x, &weighted, value);
+                }
             }
-            wp.advance_row();
+            if usage.weighted {
+                wp.advance_row();
+            }
         }
     }
     Ok(limit)
